@@ -307,7 +307,7 @@ impl RandomAccessArchive {
     
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     /// On unix this will never fail
-    pub fn path2bytes(p: &Path) -> io::Result<Cow<[u8]>> {
+    pub fn path2bytes(p: &Path) -> io::Result<Cow<'_, [u8]>> {
         use std::os::unix::ffi::OsStrExt;
         Ok(p.as_os_str().as_bytes()).map(Cow::Borrowed)
     }

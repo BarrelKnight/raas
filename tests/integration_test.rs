@@ -15,7 +15,7 @@ async fn test_download_full_archive() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -55,7 +55,7 @@ async fn test_download_directory() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -92,7 +92,7 @@ async fn test_range_request() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -128,7 +128,7 @@ async fn test_path_traversal_protection() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -155,7 +155,7 @@ async fn test_nonexistent_path() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -183,7 +183,7 @@ async fn test_empty_path_parameter() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -211,7 +211,7 @@ async fn test_content_disposition_header() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -243,7 +243,7 @@ async fn test_accept_ranges_header() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -280,7 +280,7 @@ async fn test_concurrent_requests() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -330,7 +330,7 @@ async fn test_large_file_download() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 
@@ -368,7 +368,7 @@ async fn test_error_response_json_format() {
 
     let config = AppConfig {
         data_root: temp_dir.path().to_path_buf(),
-        bind_addr: "127.0.0.1:8080".to_string(),
+        bind_addr: "0.0.0.0:8080".to_string(),
         server_performance: Default::default(),
     };
 

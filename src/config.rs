@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 /// 默认配置常量
 mod defaults {
-    pub const BIND_ADDR: &str = "127.0.0.1:8080";
+    pub const BIND_ADDR: &str = "0.0.0.0:8080";
     pub const MAX_CONCURRENT_REQUESTS: usize = 100;
     pub const THREAD_POOL_SIZE: usize = 4;
     pub const BLOCKING_QUEUE_SIZE: usize = 1024;

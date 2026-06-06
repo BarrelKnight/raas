@@ -94,7 +94,7 @@ cargo build --release
 $env:DATA_ROOT="C:\your\data\directory"
 
 # 设置监听地址(可选)
-$env:BIND_ADDR="127.0.0.1:8080"
+$env:BIND_ADDR="0.0.0.0:8080"
 
 # 启动服务器
 cargo run --release
@@ -122,7 +122,7 @@ curl -H "Range: bytes=0-1023" http://127.0.0.1:8080/api/archive/download?path=my
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
 | `DATA_ROOT` | 数据根目录 | `.` |
-| `BIND_ADDR` | 监听地址 | `127.0.0.1:8080` |
+| `BIND_ADDR` | 监听地址 | `0.0.0.0:8080` |
 | `MAX_CONCURRENT_REQUESTS` | 最大并发请求数 | `100` |
 | `THREAD_POOL_SIZE` | 线程池大小 | `4` |
 | `STREAM_READ_BUFFER_SIZE` | 流式读取缓冲区大小(字节) | `8192` |
