@@ -61,8 +61,7 @@ impl ArchiveCache {
 
 impl Default for ArchiveCache {
     fn default() -> Self {
-        // 默认最大容量为10个存档
-        Self::new(10)
+        Self::new(crate::config::ServerPerformanceConfig::default().archive_cache_max_capacity)
     }
 }
 
