@@ -6,9 +6,9 @@ mod defaults {
     pub const MAX_CONCURRENT_REQUESTS: usize = 100;
     pub const THREAD_POOL_SIZE: usize = 4;
     pub const BLOCKING_QUEUE_SIZE: usize = 1024;
-    pub const SEND_BUFFER_SIZE: usize = 65536; // 64KB
-    pub const RECV_BUFFER_SIZE: usize = 65536; // 64KB
-    pub const STREAM_READ_BUFFER_SIZE: usize = 8192; // 8KB
+    pub const SEND_BUFFER_SIZE: usize = 262144; // 256KB - 优化大文件流式传输性能
+    pub const RECV_BUFFER_SIZE: usize = 16384; // 16KB - 仅接收GET请求头，无需太大
+    pub const STREAM_READ_BUFFER_SIZE: usize = 16384; // 16KB - 平衡内存和性能，与文件系统块对齐
     pub const ARCHIVE_CACHE_MAX_CAPACITY: u64 = 100;
 }
 
@@ -153,9 +153,9 @@ mod tests {
             std::env::set_var("MAX_CONCURRENT_REQUESTS", "200");
             std::env::set_var("THREAD_POOL_SIZE", "8");
             std::env::set_var("BLOCKING_QUEUE_SIZE", "2048");
-            std::env::set_var("SEND_BUFFER_SIZE", "131072");
-            std::env::set_var("RECV_BUFFER_SIZE", "131072");
-            std::env::set_var("STREAM_READ_BUFFER_SIZE", "16384");
+            std::env::set_var("SEND_BUFFER_SIZE", "524288");  // 512KB
+            std::env::set_var("RECV_BUFFER_SIZE", "32768");  // 32KB
+            std::env::set_var("STREAM_READ_BUFFER_SIZE", "32768");  // 32KB
             std::env::set_var("ARCHIVE_CACHE_MAX_CAPACITY", "50");
         }
 
@@ -164,9 +164,9 @@ mod tests {
         assert_eq!(config.max_concurrent_requests, 200);
         assert_eq!(config.thread_pool_size, 8);
         assert_eq!(config.blocking_queue_size, 2048);
-        assert_eq!(config.send_buffer_size, 131072);
-        assert_eq!(config.recv_buffer_size, 131072);
-        assert_eq!(config.stream_read_buffer_size, 16384);
+        assert_eq!(config.send_buffer_size, 524288);
+        assert_eq!(config.recv_buffer_size, 32768);
+        assert_eq!(config.stream_read_buffer_size, 32768);
         assert_eq!(config.archive_cache_max_capacity, 50);
 
         // 清理环境变量

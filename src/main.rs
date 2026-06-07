@@ -45,10 +45,26 @@ async fn async_main(config: AppConfig) -> Result<()> {
         // 添加并发限制层
         .layer(ConcurrencyLimitLayer::new(state.config.server_performance.max_concurrent_requests));
 
-    // 配置TCP监听器
-    let listener = tokio::net::TcpListener::bind(&state.config.bind_addr)
-        .await
+    // 配置TCP监听器，应用自定义缓冲区设置
+    let addr = state.config.bind_addr.parse::<SocketAddr>()
+        .context("解析绑定地址失败")?;
+    
+    let socket = tokio::net::TcpSocket::new_v4()
+        .context("创建TCP socket失败")?;
+    
+    // 设置发送和接收缓冲区大小
+    socket.set_send_buffer_size(state.config.server_performance.send_buffer_size as u32)
+        .context("设置发送缓冲区失败")?;
+    socket.set_recv_buffer_size(state.config.server_performance.recv_buffer_size as u32)
+        .context("设置接收缓冲区失败")?;
+    
+    socket.set_reuseaddr(true)
+        .context("设置地址重用失败")?;
+    socket.bind(addr)
         .context("绑定地址失败")?;
+    
+    let listener = socket.listen(1024)
+        .context("监听连接失败")?;
     
     info!("服务器运行在 http://{}", state.config.bind_addr);
     info!("服务器性能配置:");
