@@ -1,4 +1,4 @@
-use crate::archive::random_access::RandomAccessArchive;
+use crate::archive::{Archive, ArchiveFormat, create_archive};
 use moka::sync::Cache;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -6,11 +6,12 @@ use std::sync::{Arc, RwLock};
 
 /// 存档缓存管理器
 ///
-/// 除了基于 `moka` 的容量淘汰外,还会记录所有已缓存的键,以便在源目录发生变更时
-/// 精确失效受影响的存档(见 README 开发计划 1)。
+/// 除了基于 `moka` 的容量淘汰外,还会记录所有已缓存的源路径,以便在源目录发生变更时
+/// 精确失效受影响的存档(见 README 开发计划 1)。缓存键为「源路径 + 归档格式」,
+/// 同一路径的 tar 与 zip 归档相互独立。
 pub struct ArchiveCache {
-    cache: Cache<PathBuf, Result<Arc<RandomAccessArchive>, String>>,
-    /// 已缓存键的注册表,用于按路径前缀定位需要失效的条目
+    cache: Cache<(PathBuf, ArchiveFormat), Result<Arc<dyn Archive>, String>>,
+    /// 已缓存源路径的注册表,用于按路径前缀定位需要失效的条目
     cached_keys: RwLock<HashSet<PathBuf>>,
     /// 缓存最大容量,用于注册表裁剪阈值
     max_capacity: u64,
@@ -28,13 +29,17 @@ impl ArchiveCache {
         }
     }
 
-    /// 获取存档，如果不存在则创建并缓存
-    pub fn get_or_create(&self, path: &PathBuf) -> Result<Arc<RandomAccessArchive>, anyhow::Error> {
+    /// 获取存档，如果不存在则按指定格式创建并缓存
+    pub fn get_or_create(
+        &self,
+        path: &Path,
+        format: ArchiveFormat,
+    ) -> Result<Arc<dyn Archive>, anyhow::Error> {
+        let key = (path.to_path_buf(), format);
+
         // 使用 get_with 实现原子性加载，避免并发时的重复创建
-        let result = self.cache.get_with(path.clone(), || {
-            RandomAccessArchive::create(path)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
+        let result = self.cache.get_with(key, || {
+            create_archive(path, format).map_err(|e| e.to_string())
         });
 
         // 无论成功与否都记录缓存键:失败结果同样被 moka 缓存,
@@ -66,8 +71,10 @@ impl ArchiveCache {
             return victims;
         }
 
-        for key in &victims {
-            self.cache.invalidate(key);
+        for path in &victims {
+            // 同一路径的 tar 与 zip 归档都需失效
+            self.cache.invalidate(&(path.clone(), ArchiveFormat::Tar));
+            self.cache.invalidate(&(path.clone(), ArchiveFormat::Zip));
         }
 
         let mut keys = self.cached_keys.write().unwrap();
@@ -91,7 +98,9 @@ impl ArchiveCache {
     /// 双份编译下将该方法视为未使用，因此显式允许 dead_code。
     #[allow(dead_code)]
     pub fn is_cached(&self, path: &Path) -> bool {
-        self.cache.contains_key(path)
+        let path = path.to_path_buf();
+        self.cache.contains_key(&(path.clone(), ArchiveFormat::Tar))
+            || self.cache.contains_key(&(path, ArchiveFormat::Zip))
     }
 
     /// 返回当前已缓存键的快照
@@ -105,22 +114,25 @@ impl ArchiveCache {
         let mut keys = self.cached_keys.write().unwrap();
         let prune_threshold = self.max_capacity.saturating_mul(4).max(8);
         if keys.len() as u64 > prune_threshold {
-            keys.retain(|k| self.cache.contains_key(k));
+            keys.retain(|k| self.is_cached(k));
         }
         keys.insert(key.to_path_buf());
     }
 
     #[cfg(test)]
     /// 获取存档（仅从缓存）
-    pub fn get(&self, path: &PathBuf) -> Option<Arc<RandomAccessArchive>> {
-        self.cache.get(path).and_then(|result| result.ok())
+    pub fn get(&self, path: &Path) -> Option<Arc<dyn Archive>> {
+        self.cache
+            .get(&(path.to_path_buf(), ArchiveFormat::Tar))
+            .and_then(|result| result.ok())
     }
 
     #[cfg(test)]
     /// 插入存档到缓存
-    pub fn insert(&self, path: PathBuf, archive: Arc<RandomAccessArchive>) {
+    pub fn insert(&self, path: PathBuf, archive: Arc<dyn Archive>) {
+        let key = (path.clone(), archive.format());
         self.register_key(&path);
-        self.cache.insert(path, Ok(archive));
+        self.cache.insert(key, Ok(archive));
     }
 
     #[cfg(test)]
@@ -190,7 +202,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::ArchiveCache;
-    use crate::archive::random_access::RandomAccessArchive;
+    use crate::archive::{Archive, ArchiveFormat, TarArchive};
 
     #[test]
     fn test_archive_cache_basic_operations() {
@@ -208,12 +220,12 @@ mod tests {
         let path = source_dir.to_path_buf();
 
         // 第一次获取 - 应该创建新的存档
-        let archive1_result = cache.get_or_create(&path);
+        let archive1_result = cache.get_or_create(&path, ArchiveFormat::Tar);
         assert!(archive1_result.is_ok());
         let archive1 = archive1_result.unwrap();
 
         // 第二次获取 - 应该从缓存获取相同的存档
-        let archive2_result = cache.get_or_create(&path);
+        let archive2_result = cache.get_or_create(&path, ArchiveFormat::Tar);
         assert!(archive2_result.is_ok());
         let archive2 = archive2_result.unwrap();
 
@@ -222,7 +234,7 @@ mod tests {
 
         // 验证存档基本信息
         assert_eq!(archive1.total_size(), archive2.total_size());
-        assert!(!archive1.list_files().is_empty());
+        assert!(archive1.total_size() > 0);
     }
 
     #[test]
@@ -243,7 +255,7 @@ mod tests {
         let paths: Vec<PathBuf> = temp_dirs.iter().map(|d| d.path().to_path_buf()).collect();
 
         for path in &paths {
-            let result = cache.get_or_create(path);
+            let result = cache.get_or_create(path, ArchiveFormat::Tar);
             assert!(result.is_ok());
         }
 
@@ -266,9 +278,8 @@ mod tests {
         let path = source_dir.to_path_buf();
 
         // 先插入一个存档
-        let archive = RandomAccessArchive::create(&path).unwrap();
-        let archive_arc = Arc::new(archive);
-        cache.insert(path.clone(), archive_arc.clone());
+        let archive: Arc<dyn Archive> = Arc::new(TarArchive::create(&path).unwrap());
+        cache.insert(path.clone(), archive.clone());
 
         // 尝试获取
         let retrieved = cache.get(&path);
@@ -276,7 +287,7 @@ mod tests {
 
         // 验证获取到的存档是正确的
         let retrieved_archive = retrieved.unwrap();
-        assert_eq!(Arc::as_ptr(&archive_arc), Arc::as_ptr(&retrieved_archive));
+        assert!(Arc::ptr_eq(&archive, &retrieved_archive));
     }
 
     #[test]
@@ -292,8 +303,8 @@ mod tests {
         std::fs::write(root.join("g.txt"), "y").unwrap();
 
         // 缓存 root 与 sub 两个存档
-        cache.get_or_create(&root).unwrap();
-        cache.get_or_create(&sub).unwrap();
+        cache.get_or_create(&root, ArchiveFormat::Tar).unwrap();
+        cache.get_or_create(&sub, ArchiveFormat::Tar).unwrap();
 
         // 修改 sub 下的文件:root 与 sub 都应失效
         let invalidated = cache.invalidate(&sub.join("f.txt"));
@@ -303,8 +314,8 @@ mod tests {
         assert!(cache.cached_paths().is_empty());
 
         // 重新缓存:修改 root 下的其他文件只应失效 root,不影响 sub
-        cache.get_or_create(&root).unwrap();
-        cache.get_or_create(&sub).unwrap();
+        cache.get_or_create(&root, ArchiveFormat::Tar).unwrap();
+        cache.get_or_create(&sub, ArchiveFormat::Tar).unwrap();
         let invalidated = cache.invalidate(&root.join("g.txt"));
         assert_eq!(invalidated.len(), 1);
         assert!(!cache.is_cached(&root));
@@ -324,7 +335,7 @@ mod tests {
         std::fs::write(&file_path, "content").unwrap();
 
         // 缓存单个文件为存档
-        cache.get_or_create(&file_path).unwrap();
+        cache.get_or_create(&file_path, ArchiveFormat::Tar).unwrap();
         assert!(cache.is_cached(&file_path));
 
         // 该文件自身发生变更应使其失效
@@ -345,13 +356,35 @@ mod tests {
         std::fs::write(a.join("1.txt"), "1").unwrap();
         std::fs::write(b.join("2.txt"), "2").unwrap();
 
-        cache.get_or_create(&a).unwrap();
-        cache.get_or_create(&b).unwrap();
+        cache.get_or_create(&a, ArchiveFormat::Tar).unwrap();
+        cache.get_or_create(&b, ArchiveFormat::Tar).unwrap();
         assert_eq!(cache.cached_paths().len(), 2);
 
         cache.invalidate_all();
         assert!(cache.cached_paths().is_empty());
         assert!(!cache.is_cached(&a));
         assert!(!cache.is_cached(&b));
+    }
+
+    #[test]
+    fn test_archive_cache_formats_are_independent() {
+        let cache = ArchiveCache::new(10);
+
+        let temp_dir = TempDir::new().expect("创建临时目录失败");
+        let path = temp_dir.path().to_path_buf();
+        std::fs::write(path.join("a.txt"), "content").unwrap();
+
+        let tar = cache.get_or_create(&path, ArchiveFormat::Tar).unwrap();
+        let zip = cache.get_or_create(&path, ArchiveFormat::Zip).unwrap();
+        assert_eq!(tar.format(), ArchiveFormat::Tar);
+        assert_eq!(zip.format(), ArchiveFormat::Zip);
+
+        // 两种格式各自缓存,互不影响
+        assert!(cache.is_cached(&path));
+
+        // 源文件变更后两种格式都应被失效
+        let invalidated = cache.invalidate(&path.join("a.txt"));
+        assert_eq!(invalidated.len(), 1);
+        assert!(!cache.is_cached(&path));
     }
 }

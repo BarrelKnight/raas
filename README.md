@@ -16,7 +16,7 @@
 
 ## 项目概述
 
-RAAS (Random Access Archive Stream) 是一个高性能的流式 tar 归档下载服务器,其核心功能是**将整个目录打包成一个可下载的归档文件**,解决了传统 HTTP 下载只能一次性下载单个资源的局限性。
+RAAS (Random Access Archive Stream) 是一个高性能的流式归档下载服务器,支持 **tar** 与 **zip** 两种归档格式,其核心功能是**将整个目录打包成一个可下载的归档文件**,解决了传统 HTTP 下载只能一次性下载单个资源的局限性。
 
 与传统方案不同,RAAS **无需预先创建完整的 tar 文件**即可实现流式传输。当客户端请求下载某个目录时,服务器会实时扫描目录结构、计算文件偏移量、构建虚拟索引,然后通过 HTTP 响应流式生成并传输 tar 归档数据。整个过程无需在磁盘上创建临时文件,内存占用极低,即使对于 GB 级别的大型目录也能高效处理。
 
@@ -45,6 +45,7 @@ RAAS 最具创新性的特性是**支持对 tar 压缩流的随机访问**。这
    - 正确的目录项和文件项区分
 5. **路径安全验证**: 防止路径穿越攻击,确保访问路径在 DATA_ROOT 范围内
 6. **不阻塞异步运行时**: 归档扫描与文件读取都是同步 I/O,统一放在阻塞线程池执行;流式响应体通过有界通道把数据块交回异步流,客户端断开时任务自动退出
+7. **多归档格式**: 通过 `format` 参数在 `tar` 与 `zip` 之间切换,两种格式都完整支持随机访问与 HTTP Range
 
 ### 原理
 
@@ -81,6 +82,18 @@ RAAS 最具创新性的特性是**支持对 tar 压缩流的随机访问**。这
 - 使用异步流(`async_stream`)将数据分块传输给 HTTP 响应体
 - 整个过程按需进行,内存中只保留当前读取的数据块
 
+### Zip 格式支持
+
+Zip 归档复用与 tar 相同的「扫描 → 计算偏移 → 随机访问」流程,差异在于格式本身:
+
+- **STORED 存储**: 条目数据不压缩,与 tar 一样避免占用双份存储;因此单个文件的内容区间可直接映射到源文件偏移,天然可随机访问
+- **CRC-32 可控**: Zip 规范要求每个条目记录 CRC-32。默认(未启用 `zip-crc32` feature)下 **CRC 字段直接写 0,完全不读取文件内容**,与 tar 一样只依赖元数据;启用 `zip-crc32` 后,CRC 在首次生成该条目头部时按需计算并缓存,且仅访问文件内容区间不会触发
+- **区间划分**: 整个归档被切分为「本地头 / 文件数据 / 中央目录项 / Zip64 EOCD / Zip64 定位器 / EOCD」等连续区间,给定偏移量通过二分查找定位所属区间并按需生成或读取
+- **Zip64**: 当大小、偏移或条目数超出 Zip32 上限时,自动切换为 Zip64 记录,支持超过 4GiB 的归档
+- **UTF-8 文件名**: 设置通用标志位 bit 11,正确处理中文等多字节路径
+
+> 兼容性/性能权衡: 默认关闭 CRC 时,生成的是「结构合法但校验值为 0」的 zip,标准解压工具在**读取内容**时会报告 CRC 校验失败(`unzip -t`、Python `zipfile` 等);文件结构与中央目录仍可正常解析与列举。若需要严格校验,请启用 `zip-crc32` feature(代价:首次生成头部时会额外读取一次文件内容)。
+
 ## 快速开始
 
 ### 编译
@@ -116,6 +129,16 @@ curl -O http://127.0.0.1:8080/api/archive/download?path=my_folder
 curl -H "Range: bytes=0-1023" http://127.0.0.1:8080/api/archive/download?path=my_folder
 ```
 
+#### 以 Zip 格式下载
+
+```bash
+# 完整下载
+curl -O "http://127.0.0.1:8080/api/archive/download?path=my_folder&format=zip"
+
+# Range 请求同样适用于 zip
+curl -H "Range: bytes=0-1023" "http://127.0.0.1:8080/api/archive/download?path=my_folder&format=zip"
+```
+
 
 ## 配置
 
@@ -132,19 +155,32 @@ curl -H "Range: bytes=0-1023" http://127.0.0.1:8080/api/archive/download?path=my
 | `ENABLE_FILE_WATCHER` | 是否启用文件系统监听以自动失效缓存 | `true` |
 | `FILE_WATCHER_DEBOUNCE_MS` | 文件系统事件抖动合并窗口(毫秒) | `200` |
 
+### Cargo Features
+
+| Feature | 说明 | 默认 |
+|---------|------|------|
+| `zip-crc32` | 启用 Zip 归档的 CRC-32 计算。关闭时 CRC 字段写 0、不额外读取文件;开启后按需计算,标准工具可严格校验内容 | 关闭 |
+
+启用方式:
+
+```bash
+cargo build --release --features zip-crc32
+```
+
 ## API 文档
 
 ### GET /api/archive/download
 
-流式下载目录为 tar 归档。
+流式下载目录为归档文件(默认 tar,可通过 `format` 选择 zip)。
 
 **查询参数:**
 - `path` (必需): 相对于 DATA_ROOT 的路径
+- `format` (可选): 归档格式,支持 `tar`(默认)与 `zip`
 
 **响应头:**
-- `Content-Type: application/x-tar`
+- `Content-Type: application/x-tar`(tar)或 `application/zip`(zip)
 - `Accept-Ranges: bytes`
-- `Content-Disposition: attachment; filename="<name>.tar"`
+- `Content-Disposition: attachment; filename="<name>.<ext>"`
 
 **支持 Range 请求:**
 - 请求头: `Range: bytes=start-end`
@@ -173,6 +209,16 @@ curl -H "Range: bytes=0-1023" http://127.0.0.1:8080/api/archive/download?path=my
 ### 3. Zip 压缩格式支持
 
 **目标**: 扩展归档格式选择,支持 Zip 格式同时保持随机访问特性
+
+**实现**:
+
+- 新增统一的归档抽象 `Archive` trait,`tar` 与 `zip` 各自实现 `format` / `total_size` / `stream_range`,缓存与 HTTP 处理器不感知具体格式
+- 通过查询参数 `format=tar|zip` 选择格式(默认 `tar`);缓存以「源路径 + 格式」为键,两种格式互不影响、可同时缓存,并在源目录变更时一并失效
+- Zip 采用 **STORED(不压缩)** 存储,索引构建阶段只读取目录元数据、不读取文件内容,与 tar 一样保持低内存、低首包延迟
+- CRC-32 由 `zip-crc32` feature 控制(默认关闭):关闭时字段写 0、不读取文件;启用后按需在生成条目头部时计算并缓存,仅做 Range 下载或仅访问文件内容区间不会触发额外读取
+- 随机访问:将归档切分为本地头、文件数据、中央目录项、EOCD 等连续区间,基于偏移量二分查找即可定位任意位置,完整支持 HTTP Range 与多线程下载
+- 支持 Zip64 扩展,自动处理超过 4GiB 的归档与超过 65535 个条目的目录
+- 文件名统一使用 UTF-8,正确处理中文等多字节路径
 
 ## 许可证
 

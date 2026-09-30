@@ -14,7 +14,11 @@ use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::{archive::RandomAccessArchive, error::ArchiveApiError, state::AppState};
+use crate::{
+    archive::{Archive, ArchiveFormat},
+    error::ArchiveApiError,
+    state::AppState,
+};
 
 /// 路径验证函数
 pub fn resolve_and_validate_path(
@@ -184,12 +188,10 @@ mod path_tests {
 fn populate_common_headers(
     response: &mut Response<Body>,
     file_name: &str,
+    content_type: &'static str,
 ) -> Result<(), ArchiveApiError> {
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/x-tar"),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
     let content_disposition = format!("attachment; filename=\"{}\"", file_name);
@@ -220,17 +222,12 @@ const MIN_STREAM_READ_BUFFER_SIZE: usize = 64 * 1024;
 /// (线程池较小时会明显拖慢并发)。因此把读取循环放入 `spawn_blocking`,
 /// 通过有界通道把数据块交回异步流。客户端断开时接收端被丢弃,
 /// `blocking_send` 随即失败,阻断任务随之退出。
-fn create_stream_body(
-    archive: Arc<RandomAccessArchive>,
-    start: u64,
-    end: u64,
-    buffer_size: usize,
-) -> Body {
+fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_size: usize) -> Body {
     let buffer_size = buffer_size.max(MIN_STREAM_READ_BUFFER_SIZE);
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
 
     tokio::task::spawn_blocking(move || {
-        let mut stream_reader = archive.stream_range_writer(start, end);
+        let mut stream_reader = archive.stream_range(start, end);
 
         // 优化：使用 BytesMut 管理 buffer，通过 freeze() 实现零拷贝转换
         let mut buffer = BytesMut::with_capacity(buffer_size);
@@ -280,6 +277,9 @@ pub fn archive_router() -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 pub struct RandomAccessArchiveQuery {
     path: String,
+    /// 归档格式,支持 `tar`(默认)与 `zip`
+    #[serde(default)]
+    format: Option<String>,
 }
 
 // 支持Range请求的随机访问存档下载
@@ -293,37 +293,51 @@ pub async fn download_random_access_archive(
         return Err(ArchiveApiError::BadRequest("路径不能为空".to_string()));
     }
 
+    // 解析归档格式(默认 tar)
+    let requested_format = match params.format.as_deref() {
+        None => ArchiveFormat::Tar,
+        Some(value) => ArchiveFormat::from_name(value)
+            .ok_or_else(|| ArchiveApiError::BadRequest(format!("不支持的归档格式: {}", value)))?,
+    };
+
     // 解析路径（相对于 DATA_ROOT）
     let source_path = resolve_and_validate_path(&state.config.data_root, &params.path)?;
 
     // 归档扫描是同步目录遍历,放在阻塞线程池中执行,避免占用 Tokio 工作线程
     let cache = state.archive_cache.clone();
-    let archive = tokio::task::spawn_blocking(move || cache.get_or_create(&source_path))
-        .await
-        .map_err(|e| ArchiveApiError::InternalError(anyhow::anyhow!("归档构建任务失败: {}", e)))?
-        .map_err(|e| {
-            // 如果是路径不存在相关的错误，返回 BadRequest
-            let error_msg = e.to_string();
-            if error_msg.contains("不存在")
-                || error_msg.contains("not found")
-                || error_msg.contains("No such file")
-            {
-                ArchiveApiError::BadRequest(error_msg)
-            } else {
-                ArchiveApiError::InternalError(e)
-            }
-        })?;
+    let archive =
+        tokio::task::spawn_blocking(move || cache.get_or_create(&source_path, requested_format))
+            .await
+            .map_err(|e| {
+                ArchiveApiError::InternalError(anyhow::anyhow!("归档构建任务失败: {}", e))
+            })?
+            .map_err(|e| {
+                // 如果是路径不存在相关的错误，返回 BadRequest
+                let error_msg = e.to_string();
+                if error_msg.contains("不存在")
+                    || error_msg.contains("not found")
+                    || error_msg.contains("No such file")
+                {
+                    ArchiveApiError::BadRequest(error_msg)
+                } else {
+                    ArchiveApiError::InternalError(e)
+                }
+            })?;
+
+    // 归档格式以实际创建结果为准(与缓存键保持一致)
+    let archive_format = archive.format();
 
     // 获取Range头
     let range_header = request.headers().get("range");
 
     // 设置文件名
     let file_name = format!(
-        "{}.tar",
+        "{}.{}",
         std::path::Path::new(&params.path)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("archive")
+            .unwrap_or("archive"),
+        archive_format.extension()
     );
 
     // 解析Range头，如果存在
@@ -370,7 +384,7 @@ pub async fn download_random_access_archive(
         .insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
 
     // 优化：直接填充头部，避免 create_common_headers + extend 的开销
-    populate_common_headers(&mut response, &file_name)?;
+    populate_common_headers(&mut response, &file_name, archive_format.content_type())?;
 
     // 如果是部分响应，添加Range特定的头部
     if status == StatusCode::PARTIAL_CONTENT {

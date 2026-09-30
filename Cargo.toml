@@ -17,6 +17,8 @@ serde_json = "1.0.145"
 
 # 归档
 tar = "0.4.43"
+# 仅在被 `zip-crc32` feature 启用时使用,用于按需计算 Zip 条目的 CRC-32
+crc32fast = { version = "1.4", optional = true }
 
 # 缓存
 moka = { version = "0.12.12", features = ["sync"] }
@@ -37,8 +39,19 @@ tower = { version = "0.5.1", features = ["limit"] }
 bytes = "1.11.0"
 notify = "8.2.0"
 
+[features]
+default = []
+# 启用 Zip 归档的 CRC-32 计算。
+#
+# 默认关闭:Zip 头部/中央目录中的 CRC-32 字段直接写 0,不额外读取文件,
+# 与 tar 一样只依赖目录元数据。注意关闭时标准解压工具会报告 CRC 校验失败,
+# 若需要严格校验请使用 `--features zip-crc32`。
+zip-crc32 = ["dep:crc32fast"]
+
 [dev-dependencies]
 tempfile = "3.23.0"
 http-body-util = "0.1"
 tower = { version = "0.5.1", features = ["util"] }
 serial_test = "3.2.0"
+# 仅用于在测试中独立校验生成的 Zip 归档是否合法
+zip = "2"

@@ -179,6 +179,7 @@ fn flush(cache: &ArchiveCache, pending: &mut HashSet<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::ArchiveFormat;
     use std::fs;
     use tempfile::TempDir;
 
@@ -202,7 +203,7 @@ mod tests {
         fs::write(&file_path, "initial").unwrap();
 
         let cache = Arc::new(ArchiveCache::new(10));
-        cache.get_or_create(&file_path).unwrap();
+        cache.get_or_create(&file_path, ArchiveFormat::Tar).unwrap();
         assert!(cache.is_cached(&file_path));
 
         let watcher = FileSystemWatcher::start(&root, cache.clone(), Duration::from_millis(50))
@@ -215,7 +216,7 @@ mod tests {
         assert!(invalidated, "文件变更后缓存应被自动失效");
 
         // 重新缓存后再删除文件,同样应触发失效
-        cache.get_or_create(&file_path).unwrap();
+        cache.get_or_create(&file_path, ArchiveFormat::Tar).unwrap();
         assert!(cache.is_cached(&file_path));
         fs::remove_file(&file_path).unwrap();
 

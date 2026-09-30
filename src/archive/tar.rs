@@ -1,27 +1,15 @@
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fs;
-use std::io::{self};
-use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use tar::{EntryType, Header};
 use tracing::error;
+
+use super::scanner;
+use super::{Archive, ArchiveError, ArchiveFormat};
 use crate::cache::file_handle::FileHandleCache;
-
-
-/// 随机访问存档错误
-#[derive(Debug, thiserror::Error)]
-pub enum RandomAccessArchiveError {
-    #[error("IO 错误: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("序列化错误: {0}")]
-    Serialization(#[from] anyhow::Error),
-
-    #[error("意料之外的错误: {0}")]
-    UnexpectedError(String),
-}
 
 /// 文件元数据信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,9 +24,8 @@ pub struct FileInfo {
     pub is_dir: bool,
 }
 
-
 /// 随机访问存档
-pub struct RandomAccessArchive {
+pub struct TarArchive {
     /// 源路径
     source_path: PathBuf,
     /// 文件信息索引
@@ -49,12 +36,19 @@ pub struct RandomAccessArchive {
     total_size: u64,
 }
 
-impl RandomAccessArchive {
+impl TarArchive {
     /// 创建新的随机访问存档
-    pub fn create(source_path: &Path) -> Result<Self, RandomAccessArchiveError> {
-        // 预扫描源路径，收集文件信息（已包含文件大小）
-        let mut file_infos = Vec::new();
-        Self::scan_directory(source_path, &mut file_infos)?;
+    pub fn create(source_path: &Path) -> Result<Self, ArchiveError> {
+        // 扫描源路径,收集文件信息(元数据阶段,不读取文件内容)
+        let file_infos: Vec<FileInfo> = scanner::scan_source(source_path)?
+            .into_iter()
+            .map(|entry| FileInfo {
+                path: entry.relative_path,
+                offset: 0, // 将在后续计算
+                size: entry.size,
+                is_dir: entry.is_dir,
+            })
+            .collect();
 
         // 预计算所有文件在tar中的位置，考虑可能的额外头部
         let mut file_index = HashMap::new();
@@ -90,7 +84,7 @@ impl RandomAccessArchive {
             current_pos = aligned_pos + item_total_size;
         }
 
-        Ok(RandomAccessArchive {
+        Ok(TarArchive {
             source_path: source_path.to_path_buf(),
             file_index,
             header_cache,
@@ -98,88 +92,8 @@ impl RandomAccessArchive {
         })
     }
 
-    /// 扫描目录，收集文件信息
-    fn scan_directory(
-        base_path: &Path,
-        file_infos: &mut Vec<FileInfo>,
-    ) -> Result<(), RandomAccessArchiveError> {
-        if base_path.is_file() {
-            let metadata = fs::metadata(base_path)?;
-            // 对于单个文件，使用文件名作为相对路径
-            let file_name = base_path.file_name()
-                .ok_or_else(|| {
-                    RandomAccessArchiveError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "无法获取文件名",
-                    ))
-                })?
-                .to_string_lossy()
-                .to_string();
-            
-            file_infos.push(FileInfo {
-                path: file_name,
-                offset: 0, // 将在后续计算
-                size: metadata.len(),
-                is_dir: false,
-            });
-        } else {
-            Self::scan_directory_recursive(base_path, base_path, file_infos)?;
-        }
-        Ok(())
-    }
-
-    /// 递归扫描目录
-    fn scan_directory_recursive(
-        base_path: &Path,
-        current_path: &Path,
-        file_infos: &mut Vec<FileInfo>,
-    ) -> Result<(), RandomAccessArchiveError> {
-        for entry in fs::read_dir(current_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = entry.metadata()?;
-
-            // 计算相对于基础路径的相对路径
-            let rel_path = path.strip_prefix(base_path).map_err(|_| {
-                RandomAccessArchiveError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "无法计算相对路径",
-                ))
-            })?;
-            // 确保路径使用正斜杠（tar规范）
-            let path_str = rel_path.to_string_lossy().replace('\\', "/");
-
-            if metadata.is_file() {
-                let size_from_entry = metadata.len();
-                // 在 Windows 上 entry.metadata() 可能返回缓存的大小，重新获取确保准确
-                let file_size = if cfg!(windows) {
-                    fs::metadata(&path)?.len()
-                } else {
-                    size_from_entry
-                };
-                file_infos.push(FileInfo {
-                    path: path_str,
-                    offset: 0, // 将在后续计算
-                    size: file_size,
-                    is_dir: false,
-                });
-            } else if metadata.is_dir() {
-                file_infos.push(FileInfo {
-                    path: format!("{}/", path_str), // 目录以斜杠结尾
-                    offset: 0,
-                    size: 0,
-                    is_dir: true,
-                });
-
-                // 递归扫描子目录
-                Self::scan_directory_recursive(base_path, &path, file_infos)?;
-            }
-        }
-        Ok(())
-    }
-
     /// 创建tar头部，返回主头部和可能的额外头部
-    fn create_header(file_info: &FileInfo) -> Result<Vec<u8>, RandomAccessArchiveError> {
+    fn create_header(file_info: &FileInfo) -> Result<Vec<u8>, ArchiveError> {
         let mut header = tar::Header::new_gnu();
 
         if file_info.is_dir {
@@ -246,20 +160,20 @@ impl RandomAccessArchive {
             let long_path_header_bytes = Self::align_to_512_bytest(long_path_header.as_bytes());
             let header_bytes = Self::align_to_512_bytest(header.as_bytes());
             let long_path_data_size = path_bytes.len() + 1 + padding_needed as usize; // null-terminated + padding
-            
+
             // 一次性预分配所需空间
             let mut result = Vec::with_capacity(
                 long_path_header_bytes.len() + long_path_data_size + header_bytes.len(),
             );
-            
+
             // 按顺序拼接: long_path_header_bytes + long_path_data + header_bytes
             result.extend_from_slice(&long_path_header_bytes);
-            
+
             // 直接写入路径数据 + null终止符 + 填充
             result.extend_from_slice(&path_bytes);
             result.push(0); // null terminator
             result.resize(result.len() + padding_needed as usize, 0); // padding
-            
+
             result.extend_from_slice(&header_bytes);
 
             return Ok(result);
@@ -304,7 +218,7 @@ impl RandomAccessArchive {
                 }
             })
     }
-    
+
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     /// On unix this will never fail
     pub fn path2bytes(p: &Path) -> io::Result<Cow<'_, [u8]>> {
@@ -335,23 +249,30 @@ impl RandomAccessArchive {
         RangeStreamWriter::new(self, start, end, default_cache)
     }
 
-
-    /// 获取总大小
-    pub fn total_size(&self) -> u64 {
-        self.total_size
-    }
-
     /// 获取所有文件列表
     #[cfg(test)]
     pub fn list_files(&self) -> Vec<&String> {
         self.file_index.keys().collect()
     }
+}
 
+impl Archive for TarArchive {
+    fn format(&self) -> ArchiveFormat {
+        ArchiveFormat::Tar
+    }
+
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    fn stream_range(&self, start: u64, end: u64) -> Box<dyn Read + Send + '_> {
+        Box::new(self.stream_range_writer(start, end))
+    }
 }
 
 /// 范围流写入器 - 实现Write trait
 pub struct RangeStreamWriter<'a> {
-    archive: &'a RandomAccessArchive,
+    archive: &'a TarArchive,
     end: u64,
     current_pos: u64,
     sorted_files: Vec<&'a FileInfo>,
@@ -359,7 +280,12 @@ pub struct RangeStreamWriter<'a> {
 }
 
 impl<'a> RangeStreamWriter<'a> {
-    pub fn new(archive: &'a RandomAccessArchive, start: u64, end: u64, file_handle_cache: FileHandleCache) -> Self {
+    pub fn new(
+        archive: &'a TarArchive,
+        start: u64,
+        end: u64,
+        file_handle_cache: FileHandleCache,
+    ) -> Self {
         let mut sorted_files: Vec<&FileInfo> = archive.file_index.values().collect();
         sorted_files.sort_by_key(|f| f.offset);
 
@@ -426,33 +352,33 @@ impl<'a> RangeStreamWriter<'a> {
 
     // 内部方法,用于读取数据到目标缓冲区
     // 返回实际读取的字节数
-    fn read_into_buffer(&mut self, buf: &mut [u8]) -> Result<usize, RandomAccessArchiveError> {
+    fn read_into_buffer(&mut self, buf: &mut [u8]) -> Result<usize, ArchiveError> {
         if self.current_pos >= self.end || self.current_pos >= self.archive.total_size {
             return Ok(0);
         }
-    
+
         let mut bytes_written = 0;
         let mut pos = self.current_pos;
-    
+
         // 读取数据直到填满 buf 或到达 end
         while bytes_written < buf.len() && pos < self.end && pos < self.archive.total_size {
             // 查找包含当前pos的文件
             let file_info_opt = self.find_file_by_position(pos);
-    
+
             if let Some(file_info) = file_info_opt {
                 let cached_header = self
                     .archive
                     .header_cache
                     .get(&file_info.path)
                     .expect("Header not found");
-    
+
                 let total_header_size = cached_header.len() as u64;
-    
+
                 let header_start = file_info.offset;
                 let header_end = header_start + total_header_size;
                 let content_start = header_end;
                 let content_end = content_start + file_info.size;
-    
+
                 if pos >= header_start && pos < header_end {
                     // 当前位置在头部区域 - 直接拷贝到 buf
                     let pos_in_header = (pos - header_start) as usize;
@@ -462,8 +388,9 @@ impl<'a> RangeStreamWriter<'a> {
                         std::cmp::min(max_bytes_from_header, remaining_space),
                         (self.end - pos) as usize,
                     );
-                    buf[bytes_written..bytes_written + bytes_to_read]
-                        .copy_from_slice(&cached_header[pos_in_header..pos_in_header + bytes_to_read]);
+                    buf[bytes_written..bytes_written + bytes_to_read].copy_from_slice(
+                        &cached_header[pos_in_header..pos_in_header + bytes_to_read],
+                    );
                     bytes_written += bytes_to_read;
                     pos += bytes_to_read as u64;
                 } else if pos >= content_start && pos < content_end {
@@ -478,7 +405,7 @@ impl<'a> RangeStreamWriter<'a> {
                         };
                         self.archive.source_path.join(normalized_path.as_ref())
                     };
-    
+
                     let pos_in_content = (pos - content_start) as usize;
                     let remaining_space = buf.len() - bytes_written;
                     let bytes_available_in_content = (content_end - pos) as usize;
@@ -486,14 +413,17 @@ impl<'a> RangeStreamWriter<'a> {
                         std::cmp::min(remaining_space, bytes_available_in_content),
                         (self.end - pos) as usize,
                     );
-    
+
                     // 直接从缓存读取到 buf,消除中间 buffer 分配
-                    let bytes_read = self.file_handle_cache.read_at(
-                        &source_file_path,
-                        pos_in_content as u64,
-                        &mut buf[bytes_written..bytes_written + bytes_to_read]
-                    ).map_err(|e| RandomAccessArchiveError::Io(e))?;
-                    
+                    let bytes_read = self
+                        .file_handle_cache
+                        .read_at(
+                            &source_file_path,
+                            pos_in_content as u64,
+                            &mut buf[bytes_written..bytes_written + bytes_to_read],
+                        )
+                        .map_err(|e| ArchiveError::Io(e))?;
+
                     bytes_written += bytes_read;
                     pos += bytes_read as u64;
                 } else {
@@ -501,7 +431,7 @@ impl<'a> RangeStreamWriter<'a> {
                         "Unexpected position {} outside of file content range for {}",
                         pos, file_info.path
                     );
-                    return Err(RandomAccessArchiveError::UnexpectedError(format!(
+                    return Err(ArchiveError::UnexpectedError(format!(
                         "Unexpected position {} outside of file content range for {}",
                         pos, file_info.path
                     )));
@@ -512,9 +442,9 @@ impl<'a> RangeStreamWriter<'a> {
                 let padding_needed = (512 - (pos % 512)) % 512;
                 let bytes_to_add = std::cmp::min(
                     padding_needed as usize,
-                    std::cmp::min(remaining_space, (self.end - pos) as usize)
+                    std::cmp::min(remaining_space, (self.end - pos) as usize),
                 );
-                    
+
                 // 直接填充 0 到 buf,使用 fill 替代逐字节循环
                 let fill_range = bytes_written..bytes_written + bytes_to_add;
                 buf[fill_range].fill(0);
@@ -522,7 +452,7 @@ impl<'a> RangeStreamWriter<'a> {
                 pos += bytes_to_add as u64;
             }
         }
-    
+
         self.current_pos = pos;
         Ok(bytes_written)
     }
@@ -536,7 +466,7 @@ impl<'a> std::io::Read for RangeStreamWriter<'a> {
     }
 }
 
-impl Drop for RandomAccessArchive {
+impl Drop for TarArchive {
     fn drop(&mut self) {
         // 无需清理，因为没有临时文件
     }
@@ -545,8 +475,9 @@ impl Drop for RandomAccessArchive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::Archive;
     use std::fs::File;
-    use std::io::{Read as _, Write};
+    use std::io::Write;
     use tempfile::TempDir;
     use tracing::info;
 
@@ -571,7 +502,7 @@ mod tests {
         file2.flush().unwrap(); // 确保写入磁盘
 
         // 创建随机访问存档
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
 
         // 测试元信息的正确性
         assert_eq!(archive.total_size(), archive.total_size);
@@ -632,7 +563,7 @@ mod tests {
         info!("File size: {}", file_size);
 
         // 创建随机访问存档
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
 
         // 验证长路径文件被正确处理
         let files: Vec<&String> = archive.list_files();
@@ -653,7 +584,6 @@ mod tests {
 
             // 验证存档可以正确访问长路径文件
             assert!(archive.file_index.contains_key(*long_path_file));
-
         } else {
             panic!("未找到预期的长路径文件");
         }
@@ -685,7 +615,7 @@ mod tests {
         write!(small_file, "小文件").unwrap();
 
         // 创建随机访问存档
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
 
         // 测试随机访问功能
         // 创建一个范围读取器，模拟从存档中读取特定范围的数据
@@ -736,7 +666,7 @@ mod tests {
         write!(deep_file, "深层嵌套文件内容").unwrap();
 
         // 创建随机访问存档
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
 
         // 验证所有层级的文件都被正确索引
         let files: Vec<&String> = archive.list_files();
@@ -767,11 +697,11 @@ mod tests {
         let empty_file = source_dir.join("empty.txt");
         File::create(&empty_file).unwrap();
 
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
-        
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
+
         let files: Vec<&String> = archive.list_files();
         assert_eq!(files.len(), 1);
-        
+
         let file_info = archive.file_index.get("empty.txt").unwrap();
         assert!(!file_info.is_dir);
         assert_eq!(file_info.size, 0);
@@ -782,14 +712,14 @@ mod tests {
         // 测试单个文件（非目录）
         let temp_dir = TempDir::new().expect("创建临时目录失败");
         let single_file = temp_dir.path().join("test.txt");
-        
+
         {
             let mut file = File::create(&single_file).unwrap();
             write!(file, "Single file content").unwrap();
         }
 
-        let archive = RandomAccessArchive::create(&single_file).expect("创建存档失败");
-        
+        let archive = TarArchive::create(&single_file).expect("创建存档失败");
+
         let files: Vec<&String> = archive.list_files();
         assert_eq!(files.len(), 1);
         assert!(files.iter().any(|&f| f == "test.txt"));
@@ -807,8 +737,8 @@ mod tests {
             write!(file, "Special content").unwrap();
         }
 
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
-        
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
+
         let files: Vec<&String> = archive.list_files();
         assert!(files.iter().any(|&f| f.contains("file with spaces")));
     }
@@ -825,13 +755,13 @@ mod tests {
             write!(file, "Test content").unwrap();
         }
 
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
-        
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
+
         // 尝试读取 0 字节范围
         let mut reader = archive.stream_range_writer(0, 0);
         let mut buffer = [0u8; 10];
         let bytes_read = reader.read(&mut buffer).unwrap();
-        
+
         assert_eq!(bytes_read, 0);
     }
 
@@ -847,14 +777,14 @@ mod tests {
             write!(file, "Test").unwrap();
         }
 
-        let archive = RandomAccessArchive::create(source_dir).expect("创建存档失败");
+        let archive = TarArchive::create(source_dir).expect("创建存档失败");
         let total_size = archive.total_size();
-        
+
         // 尝试读取超出范围
         let mut reader = archive.stream_range_writer(total_size, total_size + 100);
         let mut buffer = [0u8; 100];
         let bytes_read = reader.read(&mut buffer).unwrap();
-        
+
         assert_eq!(bytes_read, 0);
     }
 }

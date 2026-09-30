@@ -9,7 +9,7 @@ pub mod state;
 pub mod watcher;
 
 // 便捷重导出
-pub use archive::RandomAccessArchive;
+pub use archive::{Archive, ArchiveError, ArchiveFormat, TarArchive, ZipArchive};
 pub use cache::ArchiveCache;
 pub use config::AppConfig;
 pub use server::create_app_routes;
