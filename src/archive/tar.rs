@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -11,8 +10,14 @@ use super::scanner;
 use super::{Archive, ArchiveError, ArchiveFormat};
 use crate::cache::file_handle::FileHandleCache;
 
+/// tar 块大小
+const BLOCK_SIZE: u64 = 512;
+
+/// 归档结尾的零块数量(tar 规范要求两个 512 字节零块作为结束标记)
+const END_OF_ARCHIVE_BLOCKS: u64 = 2;
+
 /// 文件元数据信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FileInfo {
     /// 文件路径
     pub path: String,
@@ -22,17 +27,28 @@ pub struct FileInfo {
     pub size: u64,
     /// 是否是目录
     pub is_dir: bool,
+    /// 权限位
+    pub mode: u32,
+    /// 修改时间(Unix 秒)
+    pub mtime: u64,
+}
+
+/// 归档条目:元信息 + 预生成的头部字节
+struct TarEntry {
+    info: FileInfo,
+    header: Vec<u8>,
 }
 
 /// 随机访问存档
 pub struct TarArchive {
     /// 源路径
     source_path: PathBuf,
-    /// 文件信息索引
-    file_index: HashMap<String, FileInfo>,
-    /// 预计算的头部缓存
-    header_cache: HashMap<String, Vec<u8>>,
-    /// 文件总大小
+    /// 按 offset 升序排列的条目(条目间连续、无空隙)
+    entries: Vec<TarEntry>,
+    /// 归档内路径到下标的索引
+    #[allow(dead_code)]
+    path_index: HashMap<String, usize>,
+    /// 文件总大小(含结尾零块)
     total_size: u64,
 }
 
@@ -40,55 +56,42 @@ impl TarArchive {
     /// 创建新的随机访问存档
     pub fn create(source_path: &Path) -> Result<Self, ArchiveError> {
         // 扫描源路径,收集文件信息(元数据阶段,不读取文件内容)
-        let file_infos: Vec<FileInfo> = scanner::scan_source(source_path)?
-            .into_iter()
-            .map(|entry| FileInfo {
-                path: entry.relative_path,
-                offset: 0, // 将在后续计算
-                size: entry.size,
-                is_dir: entry.is_dir,
-            })
-            .collect();
+        let scanned = scanner::scan_source(source_path)?;
 
-        // 预计算所有文件在tar中的位置，考虑可能的额外头部
-        let mut file_index = HashMap::new();
-        let mut header_cache = HashMap::new();
+        let mut entries: Vec<TarEntry> = Vec::with_capacity(scanned.len());
+        let mut path_index: HashMap<String, usize> = HashMap::with_capacity(scanned.len());
         let mut current_pos = 0u64;
 
-        for info in &file_infos {
-            // 创建头部，以确定是否需要额外的LongLink头部
-            let header_data = Self::create_header(info)?;
-            let total_header_size = header_data.len() as u64;
+        for item in scanned {
+            let mut info = FileInfo {
+                path: item.relative_path,
+                offset: 0, // 将在后续计算
+                size: if item.is_dir { 0 } else { item.size },
+                is_dir: item.is_dir,
+                mode: item.mode,
+                mtime: item.mtime,
+            };
 
-            // 对齐到512字节边界
-            let aligned_pos = Self::align_to_boundary(current_pos, 512);
+            // 创建头部,以确定是否需要额外的 LongLink 头部
+            let header = Self::create_header(&info)?;
 
-            // 使用扫描阶段已获取的文件大小，避免重复fs::metadata调用
-            let actual_size = if info.is_dir { 0 } else { info.size };
+            // 对齐到 512 字节边界(条目本就按块对齐,此处作为兜底)
+            info.offset = Self::align_to_boundary(current_pos, BLOCK_SIZE);
+            let padding_size = Self::calculate_padding(info.size);
+            current_pos = info.offset + header.len() as u64 + info.size + padding_size;
 
-            let padding_size = Self::calculate_padding(actual_size);
-            let item_total_size = total_header_size + actual_size + padding_size;
-
-            // 缓存头部和构建文件索引
-            header_cache.insert(info.path.clone(), header_data);
-            file_index.insert(
-                info.path.clone(),
-                FileInfo {
-                    path: info.path.clone(),
-                    offset: aligned_pos,
-                    size: actual_size,
-                    is_dir: info.is_dir,
-                },
-            );
-
-            current_pos = aligned_pos + item_total_size;
+            path_index.insert(info.path.clone(), entries.len());
+            entries.push(TarEntry { info, header });
         }
+
+        // tar 规范要求归档以两个 512 字节零块结束
+        let total_size = current_pos + END_OF_ARCHIVE_BLOCKS * BLOCK_SIZE;
 
         Ok(TarArchive {
             source_path: source_path.to_path_buf(),
-            file_index,
-            header_cache,
-            total_size: current_pos,
+            entries,
+            path_index,
+            total_size,
         })
     }
 
@@ -104,16 +107,22 @@ impl TarArchive {
             header.set_entry_type(tar::EntryType::file());
         }
 
+        // 写入权限与修改时间,避免解包后得到 mode 000、时间恒为 1970 的文件
+        header.set_mode(file_info.mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(file_info.mtime);
+
         // 使用GNU长路径扩展，而不是简单的截断
         let header_data = Self::set_path_with_gnu_extension(&mut header, &file_info.path)?;
 
         Ok(header_data)
     }
 
-    fn align_to_512_bytest(data: &[u8]) -> Vec<u8> {
-        const BLOCK_SIZE: usize = 512;
+    fn align_to_512_bytes(data: &[u8]) -> Vec<u8> {
+        let block_size = BLOCK_SIZE as usize;
         let current_len = data.len();
-        let target_len = (current_len + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        let target_len = current_len.div_ceil(block_size) * block_size;
 
         let mut result = Vec::with_capacity(target_len);
         result.extend_from_slice(data);
@@ -157,8 +166,8 @@ impl TarArchive {
             header.set_cksum();
 
             // 预计算所有部分的总大小
-            let long_path_header_bytes = Self::align_to_512_bytest(long_path_header.as_bytes());
-            let header_bytes = Self::align_to_512_bytest(header.as_bytes());
+            let long_path_header_bytes = Self::align_to_512_bytes(long_path_header.as_bytes());
+            let header_bytes = Self::align_to_512_bytes(header.as_bytes());
             let long_path_data_size = path_bytes.len() + 1 + padding_needed as usize; // null-terminated + padding
 
             // 一次性预分配所需空间
@@ -202,7 +211,7 @@ impl TarArchive {
         p.as_os_str()
             .to_str()
             .map(|s| s.as_bytes())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "path was not valid Unicode"))
+            .ok_or_else(|| io::Error::other("path was not valid Unicode"))
             .map(|bytes| {
                 if bytes.contains(&b'\\') {
                     // Normalize to Unix-style path separators
@@ -228,7 +237,7 @@ impl TarArchive {
 
     /// 计算填充大小
     fn calculate_padding(content_size: u64) -> u64 {
-        (512 - (content_size % 512)) % 512
+        (BLOCK_SIZE - (content_size % BLOCK_SIZE)) % BLOCK_SIZE
     }
 
     /// 对齐到指定边界
@@ -241,18 +250,23 @@ impl TarArchive {
         }
     }
 
-    /// 创建一个实现了Write trait的流,用于流式写入指定范围的数据
-    ///
-    /// 重要:这个方法返回一个RangeStreamWriter,它可以被写入到任何实现了Write trait的目标中
+    /// 创建一个按字节范围读取的只读流
     pub fn stream_range_writer<'a>(&'a self, start: u64, end: u64) -> RangeStreamWriter<'a> {
-        let default_cache = FileHandleCache::new();
-        RangeStreamWriter::new(self, start, end, default_cache)
+        RangeStreamWriter::new(self, start, end, FileHandleCache::new())
     }
 
     /// 获取所有文件列表
     #[cfg(test)]
     pub fn list_files(&self) -> Vec<&String> {
-        self.file_index.keys().collect()
+        self.entries.iter().map(|e| &e.info.path).collect()
+    }
+
+    /// 按归档内路径查询条目元信息
+    #[allow(dead_code)]
+    pub fn file_info(&self, path: &str) -> Option<&FileInfo> {
+        self.path_index
+            .get(path)
+            .map(|&index| &self.entries[index].info)
     }
 }
 
@@ -270,12 +284,13 @@ impl Archive for TarArchive {
     }
 }
 
-/// 范围流写入器 - 实现Write trait
+/// 范围流读取器 - 实现 `Read` trait
 pub struct RangeStreamWriter<'a> {
     archive: &'a TarArchive,
     end: u64,
     current_pos: u64,
-    sorted_files: Vec<&'a FileInfo>,
+    /// 当前定位到的条目下标,顺序读取时作为快速路径,避免每个数据块都做二分查找
+    cursor: usize,
     file_handle_cache: FileHandleCache,
 }
 
@@ -286,68 +301,52 @@ impl<'a> RangeStreamWriter<'a> {
         end: u64,
         file_handle_cache: FileHandleCache,
     ) -> Self {
-        let mut sorted_files: Vec<&FileInfo> = archive.file_index.values().collect();
-        sorted_files.sort_by_key(|f| f.offset);
-
         RangeStreamWriter {
             archive,
             end,
             current_pos: start,
-            sorted_files,
+            cursor: 0,
             file_handle_cache,
         }
     }
 
-    fn find_file_by_position(&self, pos: u64) -> Option<&FileInfo> {
-        // 先检查边界情况
-        if self.sorted_files.is_empty() {
+    /// 条目 `index` 在归档中的结束偏移(头部 + 内容,不含填充)
+    fn item_end(&self, index: usize) -> u64 {
+        let entry = &self.archive.entries[index];
+        entry.info.offset + entry.header.len() as u64 + entry.info.size
+    }
+
+    /// 定位包含偏移 `pos` 的条目下标;`None` 表示落在填充区或归档结尾零块
+    fn locate(&mut self, pos: u64) -> Option<usize> {
+        let count = self.archive.entries.len();
+        if count == 0 {
             return None;
         }
 
-        // 检查最后一个文件，避免超出范围的情况
-        let last_file = self.sorted_files.last().unwrap();
-
-        let cached_header = self
-            .archive
-            .header_cache
-            .get(&last_file.path)
-            .expect("Header not found");
-
-        let total_header_size = cached_header.len() as u64;
-        let last_end = last_file.offset + total_header_size + last_file.size;
-        if pos >= last_end {
-            return None;
-        }
-
-        // 使用二分查找定位可能包含pos的文件
-        let files = &self.sorted_files;
-        let mut left = 0;
-        let mut right = files.len();
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let file_info = files[mid];
-
-            let total_header_size = self
-                .archive
-                .header_cache
-                .get(&file_info.path)
-                .map(|header| header.len() as u64)
-                .unwrap_or(0);
-
-            let file_start = file_info.offset;
-            let file_end = file_info.offset + total_header_size + file_info.size; // 总头部 + content
-
-            if pos >= file_start && pos < file_end {
-                return Some(file_info);
-            } else if pos < file_start {
-                right = mid;
-            } else {
-                left = mid + 1;
+        // 快速路径:仍位于游标所指条目内
+        if self.cursor < count {
+            let entry = &self.archive.entries[self.cursor];
+            if pos >= entry.info.offset && pos < self.item_end(self.cursor) {
+                return Some(self.cursor);
             }
         }
 
-        None
+        // 二分查找最后一个 offset <= pos 的条目
+        let candidate = self
+            .archive
+            .entries
+            .partition_point(|entry| entry.info.offset <= pos);
+        if candidate == 0 {
+            return None;
+        }
+
+        let index = candidate - 1;
+        if pos < self.item_end(index) {
+            self.cursor = index;
+            Some(index)
+        } else {
+            None
+        }
     }
 
     // 内部方法,用于读取数据到目标缓冲区
@@ -362,94 +361,85 @@ impl<'a> RangeStreamWriter<'a> {
 
         // 读取数据直到填满 buf 或到达 end
         while bytes_written < buf.len() && pos < self.end && pos < self.archive.total_size {
-            // 查找包含当前pos的文件
-            let file_info_opt = self.find_file_by_position(pos);
-
-            if let Some(file_info) = file_info_opt {
-                let cached_header = self
-                    .archive
-                    .header_cache
-                    .get(&file_info.path)
-                    .expect("Header not found");
-
-                let total_header_size = cached_header.len() as u64;
-
-                let header_start = file_info.offset;
-                let header_end = header_start + total_header_size;
-                let content_start = header_end;
-                let content_end = content_start + file_info.size;
-
-                if pos >= header_start && pos < header_end {
-                    // 当前位置在头部区域 - 直接拷贝到 buf
-                    let pos_in_header = (pos - header_start) as usize;
-                    let max_bytes_from_header = cached_header.len() - pos_in_header;
-                    let remaining_space = buf.len() - bytes_written;
-                    let bytes_to_read = std::cmp::min(
-                        std::cmp::min(max_bytes_from_header, remaining_space),
-                        (self.end - pos) as usize,
-                    );
-                    buf[bytes_written..bytes_written + bytes_to_read].copy_from_slice(
-                        &cached_header[pos_in_header..pos_in_header + bytes_to_read],
-                    );
-                    bytes_written += bytes_to_read;
-                    pos += bytes_to_read as u64;
-                } else if pos >= content_start && pos < content_end {
-                    // 当前位置在内容区域 - 直接读取到 buf
-                    let source_file_path = if self.archive.source_path.is_file() {
-                        self.archive.source_path.clone()
-                    } else {
-                        let normalized_path: Cow<str> = if file_info.path.ends_with('/') {
-                            Cow::Borrowed(file_info.path.trim_end_matches('/'))
-                        } else {
-                            Cow::Borrowed(&file_info.path)
-                        };
-                        self.archive.source_path.join(normalized_path.as_ref())
-                    };
-
-                    let pos_in_content = (pos - content_start) as usize;
-                    let remaining_space = buf.len() - bytes_written;
-                    let bytes_available_in_content = (content_end - pos) as usize;
-                    let bytes_to_read = std::cmp::min(
-                        std::cmp::min(remaining_space, bytes_available_in_content),
-                        (self.end - pos) as usize,
-                    );
-
-                    // 直接从缓存读取到 buf,消除中间 buffer 分配
-                    let bytes_read = self
-                        .file_handle_cache
-                        .read_at(
-                            &source_file_path,
-                            pos_in_content as u64,
-                            &mut buf[bytes_written..bytes_written + bytes_to_read],
-                        )
-                        .map_err(|e| ArchiveError::Io(e))?;
-
-                    bytes_written += bytes_read;
-                    pos += bytes_read as u64;
+            let Some(index) = self.locate(pos) else {
+                // 填充区或归档结尾零块:写入零以满足 512 字节对齐 / 结束标记
+                let remaining_space = (buf.len() - bytes_written) as u64;
+                let limit = remaining_space
+                    .min(self.end - pos)
+                    .min(self.archive.total_size - pos);
+                let padding_needed = TarArchive::calculate_padding(pos);
+                // pos 已对齐且不在任何条目内时必定位于归档结尾零块,
+                // 此时 padding 为 0,需退化为按剩余空间填充,避免死循环
+                let bytes_to_add = if padding_needed == 0 {
+                    limit
                 } else {
-                    error!(
-                        "Unexpected position {} outside of file content range for {}",
-                        pos, file_info.path
-                    );
-                    return Err(ArchiveError::UnexpectedError(format!(
-                        "Unexpected position {} outside of file content range for {}",
-                        pos, file_info.path
-                    )));
-                }
-            } else {
-                // 填充区域 - 直接写入 0 到 buf
-                let remaining_space = buf.len() - bytes_written;
-                let padding_needed = (512 - (pos % 512)) % 512;
-                let bytes_to_add = std::cmp::min(
-                    padding_needed as usize,
-                    std::cmp::min(remaining_space, (self.end - pos) as usize),
-                );
+                    padding_needed.min(limit)
+                } as usize;
 
-                // 直接填充 0 到 buf,使用 fill 替代逐字节循环
-                let fill_range = bytes_written..bytes_written + bytes_to_add;
-                buf[fill_range].fill(0);
+                buf[bytes_written..bytes_written + bytes_to_add].fill(0);
                 bytes_written += bytes_to_add;
                 pos += bytes_to_add as u64;
+                continue;
+            };
+
+            let entry = &self.archive.entries[index];
+            let header = &entry.header;
+            let header_start = entry.info.offset;
+            let header_end = header_start + header.len() as u64;
+            let content_start = header_end;
+            let content_end = content_start + entry.info.size;
+
+            if pos >= header_start && pos < header_end {
+                // 当前位置在头部区域 - 直接拷贝到 buf
+                let pos_in_header = (pos - header_start) as usize;
+                let max_bytes_from_header = header.len() - pos_in_header;
+                let remaining_space = buf.len() - bytes_written;
+                let bytes_to_read = std::cmp::min(
+                    std::cmp::min(max_bytes_from_header, remaining_space),
+                    (self.end - pos) as usize,
+                );
+                buf[bytes_written..bytes_written + bytes_to_read]
+                    .copy_from_slice(&header[pos_in_header..pos_in_header + bytes_to_read]);
+                bytes_written += bytes_to_read;
+                pos += bytes_to_read as u64;
+            } else if pos >= content_start && pos < content_end {
+                // 当前位置在内容区域 - 直接读取到 buf
+                let source_file_path = if self.archive.source_path.is_file() {
+                    self.archive.source_path.clone()
+                } else {
+                    let normalized_path: Cow<str> =
+                        Cow::Borrowed(entry.info.path.trim_end_matches('/'));
+                    self.archive.source_path.join(normalized_path.as_ref())
+                };
+
+                let pos_in_content = pos - content_start;
+                let remaining_space = buf.len() - bytes_written;
+                let bytes_available_in_content = (content_end - pos) as usize;
+                let bytes_to_read = std::cmp::min(
+                    std::cmp::min(remaining_space, bytes_available_in_content),
+                    (self.end - pos) as usize,
+                );
+
+                let bytes_read = self
+                    .file_handle_cache
+                    .read_at(
+                        &source_file_path,
+                        pos_in_content,
+                        &mut buf[bytes_written..bytes_written + bytes_to_read],
+                    )
+                    .map_err(ArchiveError::Io)?;
+
+                bytes_written += bytes_read;
+                pos += bytes_read as u64;
+            } else {
+                error!(
+                    "Unexpected position {} outside of file content range for {}",
+                    pos, entry.info.path
+                );
+                return Err(ArchiveError::UnexpectedError(format!(
+                    "Unexpected position {} outside of file content range for {}",
+                    pos, entry.info.path
+                )));
             }
         }
 
@@ -460,15 +450,9 @@ impl<'a> RangeStreamWriter<'a> {
 
 impl<'a> std::io::Read for RangeStreamWriter<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // 直接读取到 buf,彻底消除中间 Vec 分配和拷贝
+        // 直接读取到 buf,消除中间 Vec 分配和拷贝
         self.read_into_buffer(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    }
-}
-
-impl Drop for TarArchive {
-    fn drop(&mut self) {
-        // 无需清理，因为没有临时文件
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -515,18 +499,13 @@ mod tests {
 
         // 验证文件信息的正确性
         for file_path in files {
-            if file_path.contains("file1.txt") && !file_path.ends_with('/') {
-                let file_info = archive.file_index.get(file_path).unwrap();
-                assert!(!file_info.is_dir);
-                assert!(file_info.size > 0);
-            } else if file_path.contains("file2.txt") && !file_path.ends_with('/') {
-                let file_info = archive.file_index.get(file_path).unwrap();
-                assert!(!file_info.is_dir);
-                assert!(file_info.size > 0);
-            } else if file_path.ends_with('/') {
-                let file_info = archive.file_index.get(file_path).unwrap();
+            let file_info = archive.file_info(file_path).unwrap();
+            if file_path.ends_with('/') {
                 assert!(file_info.is_dir);
                 assert_eq!(file_info.size, 0);
+            } else {
+                assert!(!file_info.is_dir);
+                assert!(file_info.size > 0);
             }
         }
     }
@@ -540,7 +519,7 @@ mod tests {
         // 创建一个长路径
         let mut long_path = source_dir.to_path_buf();
         for i in 0..10 {
-            long_path.push(&format!(
+            long_path.push(format!(
                 "very_long_directory_name_that_exceeds_standard_tar_limit_{}",
                 i
             ));
@@ -574,7 +553,7 @@ mod tests {
 
         let long_path_file_option = files.iter().find(|&f| f.contains("very_long_filename"));
         if let Some(long_path_file) = long_path_file_option {
-            let file_info = archive.file_index.get(*long_path_file).unwrap();
+            let file_info = archive.file_info(long_path_file).unwrap();
             info!(
                 "Found file in archive: {} with size {} at offset {}",
                 long_path_file, file_info.size, file_info.offset
@@ -583,7 +562,7 @@ mod tests {
             assert!(file_info.size > 0);
 
             // 验证存档可以正确访问长路径文件
-            assert!(archive.file_index.contains_key(*long_path_file));
+            assert!(archive.file_info(long_path_file).is_some());
         } else {
             panic!("未找到预期的长路径文件");
         }
@@ -702,7 +681,7 @@ mod tests {
         let files: Vec<&String> = archive.list_files();
         assert_eq!(files.len(), 1);
 
-        let file_info = archive.file_index.get("empty.txt").unwrap();
+        let file_info = archive.file_info("empty.txt").unwrap();
         assert!(!file_info.is_dir);
         assert_eq!(file_info.size, 0);
     }

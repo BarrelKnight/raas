@@ -11,6 +11,7 @@ use axum::{
 use bytes::BytesMut;
 use serde::Deserialize;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -20,53 +21,42 @@ use crate::{
     state::AppState,
 };
 
-/// 路径验证函数
+/// 解析并校验请求路径
+///
+/// `root` 必须是已规范化的绝对路径(见 [`AppState::data_root`]),
+/// 以保证与 `canonicalize` 后的目标路径可直接前缀比较。
 pub fn resolve_and_validate_path(
-    root: &std::path::PathBuf,
+    root: &Path,
     relative_path: &str,
-) -> Result<std::path::PathBuf, ArchiveApiError> {
-    let root = root.canonicalize().map_err(|e| {
-        ArchiveApiError::InternalError(anyhow::anyhow!("解析数据根目录失败: {}", e))
-    })?;
-
+) -> Result<PathBuf, ArchiveApiError> {
     let full_path = root.join(relative_path);
 
-    // 检查路径是否超出数据根目录
-    // 使用 normalize 逻辑而不是 canonicalize，因为文件可能不存在
-    let normalized = if full_path.is_absolute() {
-        full_path.clone()
-    } else {
-        root.join(&full_path)
-    };
-
-    // 简单检查：确保路径没有通过 .. 跳出 root
-    if !normalized.starts_with(&root) {
+    // 初筛:拼接结果必须仍位于根目录内(拦截显式跳出)
+    if !full_path.starts_with(root) {
         return Err(ArchiveApiError::BadRequest(
             "非法路径: 超出数据根目录".to_string(),
         ));
     }
 
-    // 如果路径存在，进行 canonicalize 验证
-    if full_path.exists() {
-        let canonicalized = full_path.canonicalize().map_err(|e| {
-            ArchiveApiError::InternalError(anyhow::anyhow!("解析目标路径失败: {}", e))
-        })?;
-
-        // 再次检查 canonicalize 后的路径是否仍在 root 内
-        if !canonicalized.starts_with(&root) {
-            return Err(ArchiveApiError::BadRequest(
-                "非法路径: 超出数据根目录".to_string(),
-            ));
-        }
-
-        Ok(canonicalized)
-    } else {
-        // 路径不存在，返回 BadRequest
-        Err(ArchiveApiError::BadRequest(format!(
+    if !full_path.exists() {
+        return Err(ArchiveApiError::BadRequest(format!(
             "路径不存在: {}",
             relative_path
-        )))
+        )));
     }
+
+    // 目标存在,进一步规范化以覆盖符号链接与 `..` 的情况
+    let canonicalized = full_path
+        .canonicalize()
+        .map_err(|e| ArchiveApiError::InternalError(anyhow::anyhow!("解析目标路径失败: {}", e)))?;
+
+    if !canonicalized.starts_with(root) {
+        return Err(ArchiveApiError::BadRequest(
+            "非法路径: 超出数据根目录".to_string(),
+        ));
+    }
+
+    Ok(canonicalized)
 }
 
 #[cfg(test)]
@@ -78,7 +68,8 @@ mod path_tests {
     #[test]
     fn test_resolve_and_validate_path_success() {
         let temp_dir = tempdir().unwrap();
-        let root = temp_dir.path().to_path_buf();
+        // 契约:root 必须为已规范化路径
+        let root = temp_dir.path().canonicalize().unwrap();
 
         // 创建测试子目录
         let test_dir = root.join("test");
@@ -98,7 +89,7 @@ mod path_tests {
     #[test]
     fn test_resolve_and_validate_path_security() {
         let temp_dir = tempdir().unwrap();
-        let root = temp_dir.path().to_path_buf();
+        let root = temp_dir.path().canonicalize().unwrap();
 
         // 创建测试文件
         let safe_file = root.join("safe.txt");
@@ -120,7 +111,7 @@ mod path_tests {
     #[test]
     fn test_resolve_and_validate_path_nonexistent() {
         let temp_dir = tempdir().unwrap();
-        let root = temp_dir.path().to_path_buf();
+        let root = temp_dir.path().canonicalize().unwrap();
 
         // 不存在的路径应该返回 BadRequest
         let result = resolve_and_validate_path(&root, "nonexistent.txt");
@@ -136,51 +127,107 @@ mod path_tests {
 
     #[test]
     fn test_parse_range_header_valid() {
-        let result = super::parse_range_header("bytes=0-1023");
-        assert!(result.is_ok());
-        let ranges = result.unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], (0, 1024)); // end is exclusive
+        // 返回闭区间 (start, end)
+        let result = super::parse_range_header("bytes=0-1023", 10_000);
+        assert_eq!(result, Ok(Some((0, 1023))));
     }
 
     #[test]
-    fn test_parse_range_header_multiple_ranges() {
-        let result = super::parse_range_header("bytes=0-100, 200-300");
-        assert!(result.is_ok());
-        let ranges = result.unwrap();
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0], (0, 101));
-        assert_eq!(ranges[1], (200, 301));
+    fn test_parse_range_header_multiple_ranges_uses_first() {
+        // 仅支持单段区间,多段时取第一段
+        let result = super::parse_range_header("bytes=0-100, 200-300", 10_000);
+        assert_eq!(result, Ok(Some((0, 100))));
     }
 
     #[test]
     fn test_parse_range_header_invalid_format() {
         // 缺少 "bytes=" 前缀
-        let result = super::parse_range_header("0-100");
-        assert!(result.is_err());
+        let result = super::parse_range_header("0-100", 10_000);
+        assert_eq!(result, Err(super::RangeParseError::Malformed));
     }
 
     #[test]
     fn test_parse_range_header_open_ended() {
-        // 没有指定结束位置，应该返回错误
-        let result = super::parse_range_header("bytes=100-");
-        assert!(result.is_err());
+        // 未指定结束位置:一直读到结尾
+        let result = super::parse_range_header("bytes=100-", 500);
+        assert_eq!(result, Ok(Some((100, 499))));
     }
 
     #[test]
     fn test_parse_range_header_suffix() {
-        // 后缀范围（最后500字节），应该返回错误（需要总大小）
-        let result = super::parse_range_header("bytes=-500");
-        assert!(result.is_ok());
-        let ranges = result.unwrap();
-        assert_eq!(ranges[0], (0, 501)); // start=0, end=500+1
+        // 后缀范围:最后 500 字节
+        let result = super::parse_range_header("bytes=-500", 10_000);
+        assert_eq!(result, Ok(Some((9_500, 9_999))));
+
+        // 后缀长度超过总大小时退化为整个资源
+        let result = super::parse_range_header("bytes=-500", 100);
+        assert_eq!(result, Ok(Some((0, 99))));
+    }
+
+    #[test]
+    fn test_parse_range_header_clamps_end() {
+        // 结束位置超出总大小时裁剪到末尾
+        let result = super::parse_range_header("bytes=0-999999999999", 5_632);
+        assert_eq!(result, Ok(Some((0, 5_631))));
+    }
+
+    #[test]
+    fn test_parse_range_header_unsatisfiable() {
+        // 起始位置超出资源范围 -> 416
+        let result = super::parse_range_header("bytes=999999999-1000000000", 5_632);
+        assert_eq!(result, Err(super::RangeParseError::Unsatisfiable));
+
+        let result = super::parse_range_header("bytes=100-", 100);
+        assert_eq!(result, Err(super::RangeParseError::Unsatisfiable));
+
+        // 空资源不存在可满足区间
+        let result = super::parse_range_header("bytes=0-", 0);
+        assert_eq!(result, Err(super::RangeParseError::Unsatisfiable));
+    }
+
+    #[test]
+    fn test_parse_range_header_reversed_is_malformed() {
+        // start > end 属于语法非法,应忽略整个 Range 头而不是 panic
+        let result = super::parse_range_header("bytes=100-50", 5_632);
+        assert_eq!(result, Err(super::RangeParseError::Malformed));
     }
 
     #[test]
     fn test_parse_range_header_invalid_numbers() {
         // 非数字
-        let result = super::parse_range_header("bytes=abc-def");
-        assert!(result.is_err());
+        let result = super::parse_range_header("bytes=abc-def", 10_000);
+        assert_eq!(result, Err(super::RangeParseError::Malformed));
+    }
+}
+
+/// 计算 RFC 5987(`filename*=`)所需的百分号编码
+fn percent_encode_utf8(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// 构建 `Content-Disposition`,对非 ASCII 文件名额外附带 RFC 5987 编码
+fn build_content_disposition(file_name: &str) -> String {
+    let encoded = percent_encode_utf8(file_name);
+    let ascii_safe = file_name.is_ascii() && !file_name.contains(['"', '\\', '\r', '\n']);
+    if ascii_safe {
+        format!(
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+            file_name, encoded
+        )
+    } else {
+        format!("attachment; filename*=UTF-8''{}", encoded)
     }
 }
 
@@ -194,10 +241,9 @@ fn populate_common_headers(
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
-    let content_disposition = format!("attachment; filename=\"{}\"", file_name);
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::try_from(content_disposition)
+        HeaderValue::try_from(build_content_disposition(file_name))
             .map_err(|_| ArchiveApiError::BadRequest("文件名包含非法字符".to_string()))?,
     );
     Ok(())
@@ -229,12 +275,12 @@ fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_si
     tokio::task::spawn_blocking(move || {
         let mut stream_reader = archive.stream_range(start, end);
 
-        // 优化：使用 BytesMut 管理 buffer，通过 freeze() 实现零拷贝转换
+        // 每个数据块都以 Bytes 的所有权交给响应体,故每块需独立分配;
+        // 这里通过复用同一 BytesMut 并只在必要时扩容来降低分配开销。
         let mut buffer = BytesMut::with_capacity(buffer_size);
 
         loop {
-            // 清空但保留容量，避免重新分配
-            buffer.clear();
+            // resize 会保留已有容量,仅在容量不足时扩容
             buffer.resize(buffer_size, 0);
 
             match stream_reader.read(&mut buffer) {
@@ -242,7 +288,7 @@ fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_si
                 Ok(n) => {
                     // truncate 到实际读取的大小
                     buffer.truncate(n);
-                    // freeze() 将 BytesMut 转换为 Bytes，无需数据拷贝
+                    // split() + freeze() 把缓冲区所有权转交给 Bytes,无需数据拷贝
                     let chunk = buffer.split().freeze();
                     if tx.blocking_send(Ok(chunk)).is_err() {
                         // 接收端已关闭(客户端断开)
@@ -250,10 +296,7 @@ fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_si
                     }
                 }
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )));
+                    let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
                     break;
                 }
             }
@@ -300,8 +343,8 @@ pub async fn download_random_access_archive(
             .ok_or_else(|| ArchiveApiError::BadRequest(format!("不支持的归档格式: {}", value)))?,
     };
 
-    // 解析路径（相对于 DATA_ROOT）
-    let source_path = resolve_and_validate_path(&state.config.data_root, &params.path)?;
+    // 解析路径（相对于 DATA_ROOT,根目录已在 AppState 中规范化）
+    let source_path = resolve_and_validate_path(&state.data_root, &params.path)?;
 
     // 归档扫描是同步目录遍历,放在阻塞线程池中执行,避免占用 Tokio 工作线程
     let cache = state.archive_cache.clone();
@@ -326,9 +369,7 @@ pub async fn download_random_access_archive(
 
     // 归档格式以实际创建结果为准(与缓存键保持一致)
     let archive_format = archive.format();
-
-    // 获取Range头
-    let range_header = request.headers().get("range");
+    let total_size = archive.total_size();
 
     // 设置文件名
     let file_name = format!(
@@ -340,32 +381,41 @@ pub async fn download_random_access_archive(
         archive_format.extension()
     );
 
-    // 解析Range头，如果存在
-    let (start, end, status, content_length) = if let Some(range_val) = range_header {
-        let range_str = range_val
-            .to_str()
-            .map_err(|_| ArchiveApiError::BadRequest("无效的Range头".to_string()))?;
-        let ranges = parse_range_header(range_str)
-            .map_err(|_| ArchiveApiError::BadRequest("无法解析Range头".to_string()))?;
-
-        if let Some(&(req_start, req_end)) = ranges.first() {
-            (
-                req_start,
-                req_end,
-                StatusCode::PARTIAL_CONTENT,
-                req_end - req_start,
-            )
-        } else {
-            // 没有有效的Range
-            return Err(ArchiveApiError::BadRequest("无效的Range值".to_string()));
+    // 解析 Range 头(基于归档总大小裁剪/判定是否可满足)
+    let parsed_range = match request.headers().get(header::RANGE) {
+        Some(value) => {
+            let raw = value
+                .to_str()
+                .map_err(|_| ArchiveApiError::BadRequest("无效的Range头".to_string()))?;
+            parse_range_header(raw, total_size)
         }
-    } else {
-        // 没有Range头，返回完整文件
-        let total_size = archive.total_size();
-        (0, total_size, StatusCode::OK, total_size)
+        None => Ok(None),
     };
 
-    let total_size = archive.total_size();
+    let (start, end, status, content_length) = match parsed_range {
+        // 可满足的区间:end 由闭区间转为半开区间
+        Ok(Some((range_start, range_end))) => (
+            range_start,
+            range_end + 1,
+            StatusCode::PARTIAL_CONTENT,
+            range_end + 1 - range_start,
+        ),
+        // 语法非法的 Range 按规范忽略,返回完整内容
+        Ok(None) | Err(RangeParseError::Malformed) => (0, total_size, StatusCode::OK, total_size),
+        // 语法合法但无法满足:返回 416 并带 `Content-Range: bytes */total`
+        Err(RangeParseError::Unsatisfiable) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            let content_range = format!("bytes */{}", total_size);
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::try_from(content_range).map_err(|_| {
+                    ArchiveApiError::InternalError(anyhow::anyhow!("无效的 Content-Range 头"))
+                })?,
+            );
+            return Ok(response);
+        }
+    };
 
     // 创建响应
     let body = create_stream_body(
@@ -378,17 +428,14 @@ pub async fn download_random_access_archive(
     let mut response = Response::new(body);
     *response.status_mut() = status;
 
-    // 优化：使用 HeaderValue::from 直接转换数字，避免 format! 字符串分配
     response
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
 
-    // 优化：直接填充头部，避免 create_common_headers + extend 的开销
     populate_common_headers(&mut response, &file_name, archive_format.content_type())?;
 
-    // 如果是部分响应，添加Range特定的头部
+    // 如果是部分响应，添加Range特定的头部(end 为半开区间,减 1 得到包含端点)
     if status == StatusCode::PARTIAL_CONTENT {
-        // 优化：使用 try_from 代替 format! + from_str，减少字符串分配
         let content_range = format!("bytes {}-{}/{}", start, end - 1, total_size);
         response.headers_mut().insert(
             header::CONTENT_RANGE,
@@ -401,37 +448,74 @@ pub async fn download_random_access_archive(
     Ok(response)
 }
 
-// 解析Range头的辅助函数
-fn parse_range_header(range_str: &str) -> Result<Vec<(u64, u64)>, ()> {
-    if !range_str.starts_with("bytes=") {
-        return Err(());
+/// Range 解析失败的原因
+#[derive(Debug, PartialEq, Eq)]
+enum RangeParseError {
+    /// 语法非法,按 HTTP 规范应忽略整个 `Range` 头(返回完整内容)
+    Malformed,
+    /// 语法合法但与资源范围不相交,应返回 416
+    Unsatisfiable,
+}
+
+/// 解析 `Range` 头,返回满足的单段闭区间 `(start, end)`
+///
+/// 支持 `bytes=start-end`、`bytes=start-` 与 `bytes=-suffix` 三种形式;
+/// 多段区间仅取第一段。返回值语义:
+/// - `Ok(None)`:未提供可解析的区间(应返回完整内容)
+/// - `Ok(Some((start, end)))`:已按总大小裁剪的闭区间
+/// - `Err(RangeParseError)`:语法非法或无法满足
+fn parse_range_header(
+    range_str: &str,
+    total_size: u64,
+) -> Result<Option<(u64, u64)>, RangeParseError> {
+    let specs = range_str
+        .strip_prefix("bytes=")
+        .ok_or(RangeParseError::Malformed)?
+        .trim();
+    if specs.is_empty() {
+        return Err(RangeParseError::Malformed);
     }
 
-    let ranges_str = &range_str[6..]; // 移除 "bytes=" 前缀
-    let mut ranges = Vec::new();
+    // 空资源不存在任何可满足的字节区间
+    if total_size == 0 {
+        return Err(RangeParseError::Unsatisfiable);
+    }
 
-    for range_part in ranges_str.split(',') {
-        let range_part = range_part.trim();
-        if let Some(dash_idx) = range_part.find('-') {
-            let start_str = &range_part[..dash_idx];
-            let end_str = &range_part[dash_idx + 1..].trim();
+    let first = specs.split(',').next().unwrap_or("").trim();
+    let (start_str, end_str) = first.split_once('-').ok_or(RangeParseError::Malformed)?;
+    let (start_str, end_str) = (start_str.trim(), end_str.trim());
 
-            let start = if start_str.is_empty() {
-                0
-            } else {
-                start_str.parse::<u64>().map_err(|_| ())?
-            };
-
-            let end = if end_str.is_empty() {
-                // 如果没有指定结束位置，返回错误，因为我们需要知道总大小
-                return Err(());
-            } else {
-                end_str.parse::<u64>().map_err(|_| ())? + 1 // +1 因为Range是包含结束位置的，但我们的read_range是半开放区间的
-            };
-
-            ranges.push((start, end));
+    match (start_str.is_empty(), end_str.is_empty()) {
+        // -N:最后 N 字节
+        (true, false) => {
+            let suffix: u64 = end_str.parse().map_err(|_| RangeParseError::Malformed)?;
+            if suffix == 0 {
+                return Err(RangeParseError::Unsatisfiable);
+            }
+            let len = suffix.min(total_size);
+            Ok(Some((total_size - len, total_size - 1)))
         }
+        // N-:从 N 到结尾
+        (false, true) => {
+            let start: u64 = start_str.parse().map_err(|_| RangeParseError::Malformed)?;
+            if start >= total_size {
+                return Err(RangeParseError::Unsatisfiable);
+            }
+            Ok(Some((start, total_size - 1)))
+        }
+        // N-M:显式区间
+        (false, false) => {
+            let start: u64 = start_str.parse().map_err(|_| RangeParseError::Malformed)?;
+            let end: u64 = end_str.parse().map_err(|_| RangeParseError::Malformed)?;
+            // last-byte-pos 小于 first-byte-pos 属于非法语法,忽略整个头
+            if start > end {
+                return Err(RangeParseError::Malformed);
+            }
+            if start >= total_size {
+                return Err(RangeParseError::Unsatisfiable);
+            }
+            Ok(Some((start, end.min(total_size - 1))))
+        }
+        (true, true) => Err(RangeParseError::Malformed),
     }
-
-    Ok(ranges)
 }

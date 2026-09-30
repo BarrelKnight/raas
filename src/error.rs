@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_internal_error() {
-        let io_error = std::io::Error::new(std::io::ErrorKind::Other, "IO错误");
+        let io_error = std::io::Error::other("IO错误");
         let error = ArchiveApiError::from(io_error);
         let response = error.into_response();
 

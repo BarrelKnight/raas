@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -10,6 +11,8 @@ use crate::watcher::FileSystemWatcher;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
+    /// 已规范化的数据根目录(启动时 canonicalize 一次,避免每请求重复解析)
+    pub data_root: PathBuf,
     pub archive_cache: Arc<ArchiveCache>,
     /// 文件系统监听器（保持存活即可，Drop 时会自动停止监听）
     pub file_watcher: Option<Arc<FileSystemWatcher>>,
@@ -22,10 +25,17 @@ impl AppState {
             config_arc.server_performance.archive_cache_max_capacity,
         ));
 
+        // 提前规范化根目录:路径校验依赖它与目标路径同为规范化形式
+        let data_root = config_arc
+            .data_root
+            .canonicalize()
+            .unwrap_or_else(|_| config_arc.data_root.clone());
+
         let file_watcher = Self::start_file_watcher(&config_arc, &archive_cache);
 
         Self {
             config: config_arc,
+            data_root,
             archive_cache,
             file_watcher,
         }

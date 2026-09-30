@@ -21,6 +21,32 @@ pub struct ScannedEntry {
     pub size: u64,
     /// 是否为目录
     pub is_dir: bool,
+    /// 权限位(非 Unix 平台使用 0644/0755 作为合理默认值)
+    pub mode: u32,
+    /// 修改时间(Unix 秒,无法获取时为 0)
+    pub mtime: u64,
+}
+
+/// 提取权限位
+#[cfg(unix)]
+fn entry_mode(metadata: &fs::Metadata, _is_dir: bool) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn entry_mode(_metadata: &fs::Metadata, is_dir: bool) -> u32 {
+    if is_dir { 0o755 } else { 0o644 }
+}
+
+/// 提取修改时间(Unix 秒)
+fn entry_mtime(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 扫描源路径
@@ -44,6 +70,8 @@ pub fn scan_source(source: &Path) -> Result<Vec<ScannedEntry>, ArchiveError> {
             source_path: source.to_path_buf(),
             size: metadata.len(),
             is_dir: false,
+            mode: entry_mode(&metadata, false),
+            mtime: entry_mtime(&metadata),
         });
     } else {
         scan_dir(source, source, &mut entries)?;
@@ -74,17 +102,19 @@ fn scan_dir(
 
         if metadata.is_file() {
             // 在 Windows 上 entry.metadata() 可能返回缓存的大小,重新获取确保准确
-            let size = if cfg!(windows) {
-                fs::metadata(&path)?.len()
+            let metadata = if cfg!(windows) {
+                fs::metadata(&path)?
             } else {
-                metadata.len()
+                metadata
             };
 
             entries.push(ScannedEntry {
                 relative_path: rel_str,
                 source_path: path,
-                size,
+                size: metadata.len(),
                 is_dir: false,
+                mode: entry_mode(&metadata, false),
+                mtime: entry_mtime(&metadata),
             });
         } else if metadata.is_dir() {
             entries.push(ScannedEntry {
@@ -92,6 +122,8 @@ fn scan_dir(
                 source_path: path.clone(),
                 size: 0,
                 is_dir: true,
+                mode: entry_mode(&metadata, true),
+                mtime: entry_mtime(&metadata),
             });
 
             scan_dir(base_path, &path, entries)?;

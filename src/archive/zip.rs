@@ -275,8 +275,17 @@ impl ZipArchive {
         }
     }
 
-    /// 生成本地文件头字节
+    /// 生成本地文件头字节(仅供测试)
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn local_header_bytes(&self, entry: &ZipEntry) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(entry.local_header_len as usize);
+        self.write_local_header(entry, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// 将本地文件头写入 `buf`(调用前 `buf` 应为空)
+    fn write_local_header(&self, entry: &ZipEntry, buf: &mut Vec<u8>) -> io::Result<()> {
         let crc = self.entry_crc(entry)?;
         let version = if entry.local_zip64 {
             VERSION_ZIP64
@@ -284,7 +293,6 @@ impl ZipArchive {
             VERSION_DEFAULT
         };
 
-        let mut buf = Vec::with_capacity(entry.local_header_len as usize);
         buf.extend_from_slice(&SIGNATURE_LOCAL.to_le_bytes());
         buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&FLAG_UTF8.to_le_bytes());
@@ -316,11 +324,20 @@ impl ZipArchive {
         }
 
         debug_assert_eq!(buf.len() as u64, entry.local_header_len);
+        Ok(())
+    }
+
+    /// 生成中央目录项字节(仅供测试)
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn central_entry_bytes(&self, entry: &ZipEntry) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(entry.central_len as usize);
+        self.write_central_entry(entry, &mut buf)?;
         Ok(buf)
     }
 
-    /// 生成中央目录项字节
-    fn central_entry_bytes(&self, entry: &ZipEntry) -> io::Result<Vec<u8>> {
+    /// 将中央目录项写入 `buf`(调用前 `buf` 应为空)
+    fn write_central_entry(&self, entry: &ZipEntry, buf: &mut Vec<u8>) -> io::Result<()> {
         let crc = self.entry_crc(entry)?;
         let needs_zip64 = entry.central_size_zip64 || entry.central_offset_zip64;
         let version = if needs_zip64 {
@@ -343,7 +360,6 @@ impl ZipArchive {
             (ZIP64_EXTRA_HEADER as usize + extra_data.len()) as u16
         };
 
-        let mut buf = Vec::with_capacity(entry.central_len as usize);
         buf.extend_from_slice(&SIGNATURE_CENTRAL.to_le_bytes());
         buf.extend_from_slice(&VERSION_DEFAULT.to_le_bytes()); // version made by
         buf.extend_from_slice(&version.to_le_bytes());
@@ -381,13 +397,20 @@ impl ZipArchive {
         }
 
         debug_assert_eq!(buf.len() as u64, entry.central_len);
-        Ok(buf)
+        Ok(())
     }
 
-    /// 生成 Zip64 EOCD 记录
+    /// 生成 Zip64 EOCD 记录(仅供测试)
+    #[cfg(test)]
     fn zip64_eocd_bytes(&self) -> Vec<u8> {
-        let count = self.entries.len() as u64;
         let mut buf = Vec::with_capacity(ZIP64_EOCD_LEN as usize);
+        self.write_zip64_eocd(&mut buf);
+        buf
+    }
+
+    /// 将 Zip64 EOCD 记录写入 `buf`(调用前 `buf` 应为空)
+    fn write_zip64_eocd(&self, buf: &mut Vec<u8>) {
+        let count = self.entries.len() as u64;
         buf.extend_from_slice(&SIGNATURE_ZIP64_EOCD.to_le_bytes());
         buf.extend_from_slice(&(ZIP64_EOCD_LEN - 12).to_le_bytes());
         buf.extend_from_slice(&VERSION_DEFAULT.to_le_bytes());
@@ -398,23 +421,35 @@ impl ZipArchive {
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&self.cd_size.to_le_bytes());
         buf.extend_from_slice(&self.cd_offset.to_le_bytes());
+    }
+
+    /// 生成 Zip64 EOCD 定位器(仅供测试)
+    #[cfg(test)]
+    fn zip64_locator_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ZIP64_LOCATOR_LEN as usize);
+        self.write_zip64_locator(&mut buf);
         buf
     }
 
-    /// 生成 Zip64 EOCD 定位器
-    fn zip64_locator_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(ZIP64_LOCATOR_LEN as usize);
+    /// 将 Zip64 EOCD 定位器写入 `buf`(调用前 `buf` 应为空)
+    fn write_zip64_locator(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&SIGNATURE_ZIP64_LOCATOR.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&self.zip64_eocd_offset.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
+    }
+
+    /// 生成 EOCD 记录(仅供测试)
+    #[cfg(test)]
+    fn eocd_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(EOCD_FIXED as usize);
+        self.write_eocd(&mut buf);
         buf
     }
 
-    /// 生成 EOCD 记录
-    fn eocd_bytes(&self) -> Vec<u8> {
+    /// 将 EOCD 记录写入 `buf`(调用前 `buf` 应为空)
+    fn write_eocd(&self, buf: &mut Vec<u8>) {
         let count = self.entries.len() as u64;
-        let mut buf = Vec::with_capacity(EOCD_FIXED as usize);
         buf.extend_from_slice(&SIGNATURE_EOCD.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
@@ -423,17 +458,26 @@ impl ZipArchive {
         buf.extend_from_slice(&(self.cd_size.min(U32_MAX) as u32).to_le_bytes());
         buf.extend_from_slice(&(self.cd_offset.min(U32_MAX) as u32).to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf
     }
 
-    /// 生成非数据区间的完整字节
-    fn segment_bytes(&self, kind: SegmentKind) -> io::Result<Vec<u8>> {
+    /// 将非数据区间写入 `buf`(调用前 `buf` 会被清空)
+    fn write_segment_into(&self, kind: SegmentKind, buf: &mut Vec<u8>) -> io::Result<()> {
+        buf.clear();
         match kind {
-            SegmentKind::LocalHeader(index) => self.local_header_bytes(&self.entries[index]),
-            SegmentKind::CentralEntry(index) => self.central_entry_bytes(&self.entries[index]),
-            SegmentKind::Zip64Eocd => Ok(self.zip64_eocd_bytes()),
-            SegmentKind::Zip64Locator => Ok(self.zip64_locator_bytes()),
-            SegmentKind::Eocd => Ok(self.eocd_bytes()),
+            SegmentKind::LocalHeader(index) => self.write_local_header(&self.entries[index], buf),
+            SegmentKind::CentralEntry(index) => self.write_central_entry(&self.entries[index], buf),
+            SegmentKind::Zip64Eocd => {
+                self.write_zip64_eocd(buf);
+                Ok(())
+            }
+            SegmentKind::Zip64Locator => {
+                self.write_zip64_locator(buf);
+                Ok(())
+            }
+            SegmentKind::Eocd => {
+                self.write_eocd(buf);
+                Ok(())
+            }
             SegmentKind::Data(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "数据区间应按流式方式读取",
@@ -479,6 +523,8 @@ pub struct ZipRangeReader<'a> {
     end: u64,
     current_pos: u64,
     file_handle_cache: FileHandleCache,
+    /// 生成非数据区间(本地头 / 中央目录项 / EOCD)时的复用缓冲,避免逐区间分配
+    scratch: Vec<u8>,
 }
 
 impl<'a> ZipRangeReader<'a> {
@@ -488,6 +534,7 @@ impl<'a> ZipRangeReader<'a> {
             end,
             current_pos: start,
             file_handle_cache: FileHandleCache::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -531,9 +578,11 @@ impl<'a> ZipRangeReader<'a> {
                     pos += read as u64;
                 }
                 kind => {
-                    let bytes = self.archive.segment_bytes(kind)?;
+                    let archive = self.archive;
+                    archive.write_segment_into(kind, &mut self.scratch)?;
                     let start = offset_in_segment as usize;
-                    buf[written..written + want].copy_from_slice(&bytes[start..start + want]);
+                    buf[written..written + want]
+                        .copy_from_slice(&self.scratch[start..start + want]);
                     written += want;
                     pos += want as u64;
                 }

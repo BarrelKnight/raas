@@ -43,6 +43,7 @@ RAAS 最具创新性的特性是**支持对 tar 压缩流的随机访问**。这
    - 支持 GNU LongPath 扩展,处理超过 100 字符的长路径
    - 严格的 512 字节对齐处理
    - 正确的目录项和文件项区分
+   - 保留源文件的权限位与修改时间,并以规范要求的两个 512 字节零块结束归档
 5. **路径安全验证**: 防止路径穿越攻击,确保访问路径在 DATA_ROOT 范围内
 6. **不阻塞异步运行时**: 归档扫描与文件读取都是同步 I/O,统一放在阻塞线程池执行;流式响应体通过有界通道把数据块交回异步流,客户端断开时任务自动退出
 7. **多归档格式**: 通过 `format` 参数在 `tar` 与 `zip` 之间切换,两种格式都完整支持随机访问与 HTTP Range
@@ -169,6 +170,10 @@ cargo build --release --features zip-crc32
 
 ## API 文档
 
+### GET /health
+
+健康检查,返回 `{"status":"ok"}`。
+
 ### GET /api/archive/download
 
 流式下载目录为归档文件(默认 tar,可通过 `format` 选择 zip)。
@@ -184,6 +189,9 @@ cargo build --release --features zip-crc32
 
 **支持 Range 请求:**
 - 请求头: `Range: bytes=start-end`
+- 支持的区间形式:`bytes=start-end`、`bytes=start-`(到结尾)、`bytes=-N`(最后 N 字节);多段区间仅取第一段
+- 结束位置超出归档大小时自动裁剪到末尾;起始位置超出范围时返回 `416 Range Not Satisfiable`
+- 语法非法的 `Range` 头按 HTTP 规范忽略,返回完整内容(`200`)
 - 响应状态: `206 Partial Content`
 - 响应头: `Content-Range: bytes start-end/total`
 

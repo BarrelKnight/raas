@@ -98,6 +98,7 @@ async fn async_main(config: AppConfig) -> Result<()> {
         state.config.server_performance.recv_buffer_size
     );
     info!("API 端点:");
+    info!("  GET /health - 健康检查");
     info!("  GET /api/archive/download?path=<路径> - 流式压缩下载");
     info!("");
     info!("按 Ctrl+C 停止服务");
@@ -106,8 +107,18 @@ async fn async_main(config: AppConfig) -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .context("启动服务器失败")?;
 
     Ok(())
+}
+
+/// 等待关闭信号(Ctrl+C),触发优雅退出
+async fn shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::error!("监听关闭信号失败: {}", err);
+        return;
+    }
+    info!("收到关闭信号,正在优雅退出...");
 }

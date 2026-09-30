@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
@@ -22,6 +22,9 @@ use crate::cache::ArchiveCache;
 
 /// 停止信号的轮询间隔,决定监听线程退出的最大延迟
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 抖动合并窗口的总时长上限,避免持续事件流把 flush 无限推迟
+const MAX_DEBOUNCE_WINDOW: Duration = Duration::from_secs(2);
 
 /// 文件系统监听器
 ///
@@ -106,9 +109,15 @@ fn run_worker(
             Ok(event) => {
                 collect_event(&mut pending, event);
 
-                // 在抖动窗口内继续合并后续事件,避免同一批变更被反复处理
+                // 在抖动窗口内继续合并后续事件,避免同一批变更被反复处理;
+                // 同时限制总合并时长,防止持续事件流导致 flush 被无限推迟
+                let deadline = Instant::now() + MAX_DEBOUNCE_WINDOW;
                 loop {
-                    match event_rx.recv_timeout(debounce) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match event_rx.recv_timeout(debounce.min(remaining)) {
                         Ok(event) => collect_event(&mut pending, event),
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => {
