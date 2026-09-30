@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use tar::{EntryType, Header};
-use tracing::error;
+use tracing::{debug, error};
 
 use super::scanner;
 use super::{Archive, ArchiveError, ArchiveFormat};
@@ -86,6 +86,13 @@ impl TarArchive {
 
         // tar 规范要求归档以两个 512 字节零块结束
         let total_size = current_pos + END_OF_ARCHIVE_BLOCKS * BLOCK_SIZE;
+
+        debug!(
+            source = %source_path.display(),
+            entries = entries.len(),
+            total_size,
+            "tar 归档索引构建完成"
+        );
 
         Ok(TarArchive {
             source_path: source_path.to_path_buf(),

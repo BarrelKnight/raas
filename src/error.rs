@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::json;
-use tracing::error;
+use tracing::{error, warn};
 
 /// API 错误响应
 #[derive(Debug, thiserror::Error)]
@@ -33,13 +33,16 @@ impl IntoResponse for ArchiveApiError {
         let error_msg = self.to_string();
 
         let (status_code, error_type) = match &self {
-            ArchiveApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BadRequest"),
+            ArchiveApiError::BadRequest(_) => {
+                // 客户端错误属于预期情况,记 warn 而非 error
+                warn!(error_type = "BadRequest", "{}", error_msg);
+                (StatusCode::BAD_REQUEST, "BadRequest")
+            }
             ArchiveApiError::InternalError(_) => {
+                error!(error_type = "InternalError", "{}", error_msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
             }
         };
-
-        error!("[{}] {}", error_type, error_msg);
 
         (
             status_code,

@@ -14,6 +14,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::{Archive, ArchiveFormat},
@@ -268,12 +269,21 @@ const MIN_STREAM_READ_BUFFER_SIZE: usize = 64 * 1024;
 /// (线程池较小时会明显拖慢并发)。因此把读取循环放入 `spawn_blocking`,
 /// 通过有界通道把数据块交回异步流。客户端断开时接收端被丢弃,
 /// `blocking_send` 随即失败,阻断任务随之退出。
-fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_size: usize) -> Body {
+fn create_stream_body(
+    archive: Arc<dyn Archive>,
+    start: u64,
+    end: u64,
+    buffer_size: usize,
+    path: String,
+) -> Body {
     let buffer_size = buffer_size.max(MIN_STREAM_READ_BUFFER_SIZE);
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
 
     tokio::task::spawn_blocking(move || {
         let mut stream_reader = archive.stream_range(start, end);
+        let started = std::time::Instant::now();
+        let mut sent_bytes = 0u64;
+        let mut aborted_by_client = false;
 
         // 每个数据块都以 Bytes 的所有权交给响应体,故每块需独立分配;
         // 这里通过复用同一 BytesMut 并只在必要时扩容来降低分配开销。
@@ -292,15 +302,28 @@ fn create_stream_body(archive: Arc<dyn Archive>, start: u64, end: u64, buffer_si
                     let chunk = buffer.split().freeze();
                     if tx.blocking_send(Ok(chunk)).is_err() {
                         // 接收端已关闭(客户端断开)
+                        aborted_by_client = true;
                         break;
                     }
+                    sent_bytes += n as u64;
                 }
                 Err(e) => {
+                    error!(path = %path, error = %e, "流式读取归档失败");
                     let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
                     break;
                 }
             }
         }
+
+        debug!(
+            path = %path,
+            start,
+            end,
+            sent_bytes,
+            aborted_by_client,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "归档流式传输结束"
+        );
     });
 
     let stream = stream! {
@@ -346,7 +369,15 @@ pub async fn download_random_access_archive(
     // 解析路径（相对于 DATA_ROOT,根目录已在 AppState 中规范化）
     let source_path = resolve_and_validate_path(&state.data_root, &params.path)?;
 
+    debug!(
+        path = %params.path,
+        format = ?requested_format,
+        resolved = %source_path.display(),
+        "收到归档下载请求"
+    );
+
     // 归档扫描是同步目录遍历,放在阻塞线程池中执行,避免占用 Tokio 工作线程
+    let build_started = std::time::Instant::now();
     let cache = state.archive_cache.clone();
     let archive =
         tokio::task::spawn_blocking(move || cache.get_or_create(&source_path, requested_format))
@@ -371,6 +402,14 @@ pub async fn download_random_access_archive(
     let archive_format = archive.format();
     let total_size = archive.total_size();
 
+    debug!(
+        path = %params.path,
+        format = %archive_format.extension(),
+        total_size,
+        elapsed_ms = build_started.elapsed().as_millis() as u64,
+        "归档索引就绪"
+    );
+
     // 设置文件名
     let file_name = format!(
         "{}.{}",
@@ -382,28 +421,50 @@ pub async fn download_random_access_archive(
     );
 
     // 解析 Range 头(基于归档总大小裁剪/判定是否可满足)
-    let parsed_range = match request.headers().get(header::RANGE) {
-        Some(value) => {
-            let raw = value
+    let range_value = request.headers().get(header::RANGE);
+    let range_str = match range_value {
+        Some(value) => Some(
+            value
                 .to_str()
-                .map_err(|_| ArchiveApiError::BadRequest("无效的Range头".to_string()))?;
-            parse_range_header(raw, total_size)
-        }
+                .map_err(|_| ArchiveApiError::BadRequest("无效的Range头".to_string()))?,
+        ),
+        None => None,
+    };
+    let parsed_range = match range_str {
+        Some(raw) => parse_range_header(raw, total_size),
         None => Ok(None),
     };
 
     let (start, end, status, content_length) = match parsed_range {
         // 可满足的区间:end 由闭区间转为半开区间
-        Ok(Some((range_start, range_end))) => (
-            range_start,
-            range_end + 1,
-            StatusCode::PARTIAL_CONTENT,
-            range_end + 1 - range_start,
-        ),
+        Ok(Some((range_start, range_end))) => {
+            debug!(
+                range = ?range_str,
+                start = range_start,
+                end = range_end,
+                "命中的 Range 请求"
+            );
+            (
+                range_start,
+                range_end + 1,
+                StatusCode::PARTIAL_CONTENT,
+                range_end + 1 - range_start,
+            )
+        }
         // 语法非法的 Range 按规范忽略,返回完整内容
-        Ok(None) | Err(RangeParseError::Malformed) => (0, total_size, StatusCode::OK, total_size),
+        Ok(None) | Err(RangeParseError::Malformed) => {
+            if let Some(raw) = range_str {
+                warn!(range = %raw, "Range 头语法非法,已忽略并返回完整内容");
+            }
+            (0, total_size, StatusCode::OK, total_size)
+        }
         // 语法合法但无法满足:返回 416 并带 `Content-Range: bytes */total`
         Err(RangeParseError::Unsatisfiable) => {
+            warn!(
+                range = ?range_str,
+                total_size,
+                "Range 无法满足,返回 416"
+            );
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
             let content_range = format!("bytes */{}", total_size);
@@ -417,12 +478,22 @@ pub async fn download_random_access_archive(
         }
     };
 
+    debug!(
+        path = %params.path,
+        status = status.as_u16(),
+        start,
+        end,
+        content_length,
+        "开始流式响应"
+    );
+
     // 创建响应
     let body = create_stream_body(
         archive,
         start,
         end,
         state.config.server_performance.stream_read_buffer_size,
+        params.path.clone(),
     );
 
     let mut response = Response::new(body);

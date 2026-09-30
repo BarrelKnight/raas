@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "zip-crc32")]
 use std::sync::OnceLock;
 
+use tracing::debug;
+#[cfg(feature = "zip-crc32")]
+use tracing::trace;
+
 use super::scanner;
 use super::{Archive, ArchiveError, ArchiveFormat};
 use crate::cache::file_handle::FileHandleCache;
@@ -240,6 +244,14 @@ impl ZipArchive {
             kind: SegmentKind::Eocd,
         });
 
+        debug!(
+            source = %source_path.display(),
+            entries = entries.len(),
+            total_size = total,
+            zip64 = needs_zip64_eocd,
+            "zip 归档索引构建完成"
+        );
+
         Ok(ZipArchive {
             entries,
             segments,
@@ -263,7 +275,10 @@ impl ZipArchive {
         {
             let source = entry.source_path.as_ref().expect("文件条目必须包含源路径");
 
-            match entry.crc.get_or_init(|| compute_crc32(source, entry.size)) {
+            match entry.crc.get_or_init(|| {
+                trace!(path = %source.display(), size = entry.size, "计算 Zip 条目 CRC-32");
+                compute_crc32(source, entry.size)
+            }) {
                 Ok(crc) => Ok(*crc),
                 Err(message) => Err(io::Error::other(message.clone())),
             }

@@ -7,6 +7,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use tracing::debug;
 
 use super::ArchiveError;
 
@@ -53,6 +56,7 @@ fn entry_mtime(metadata: &fs::Metadata) -> u64 {
 ///
 /// 若 `source` 为单个文件,则产出以文件名命名的单条记录;否则递归扫描目录。
 pub fn scan_source(source: &Path) -> Result<Vec<ScannedEntry>, ArchiveError> {
+    let started = Instant::now();
     let mut entries = Vec::new();
 
     if source.is_file() {
@@ -76,6 +80,13 @@ pub fn scan_source(source: &Path) -> Result<Vec<ScannedEntry>, ArchiveError> {
     } else {
         scan_dir(source, source, &mut entries)?;
     }
+
+    debug!(
+        source = %source.display(),
+        entries = entries.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "源目录扫描完成"
+    );
 
     Ok(entries)
 }

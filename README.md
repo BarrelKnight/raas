@@ -156,6 +156,18 @@ curl -H "Range: bytes=0-1023" "http://127.0.0.1:8080/api/archive/download?path=m
 | `ENABLE_FILE_WATCHER` | 是否启用文件系统监听以自动失效缓存 | `true` |
 | `FILE_WATCHER_DEBOUNCE_MS` | 文件系统事件抖动合并窗口(毫秒) | `200` |
 
+### 日志
+
+服务使用 `tracing` 输出结构化日志,默认级别为 `info`,每个请求会记录方法、路径、状态码与耗时。可通过环境变量 `RUST_LOG` 调整:
+
+```bash
+# 输出缓存命中/未命中、归档构建与流式传输统计等
+export RUST_LOG=debug
+
+# 含缓存失效明细与 zip CRC 计算等更细粒度信息
+export RUST_LOG=raas=trace
+```
+
 ### Cargo Features
 
 | Feature | 说明 | 默认 |

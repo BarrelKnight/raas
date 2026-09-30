@@ -29,8 +29,11 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(config: AppConfig) -> Result<()> {
-    // 初始化日志
+    // 初始化日志:默认 info,可通过 RUST_LOG 调整(如 RUST_LOG=debug)
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_target(true)
         .with_level(true)
         .init();
@@ -40,6 +43,7 @@ async fn async_main(config: AppConfig) -> Result<()> {
 
     // 初始化应用状态
     let state = state::AppState::new(config);
+    info!("数据根目录(已规范化): {:?}", state.data_root);
 
     if state.file_watcher.is_some() {
         info!("文件系统监听已启用，源目录变更将自动失效缓存");
@@ -96,6 +100,14 @@ async fn async_main(config: AppConfig) -> Result<()> {
     info!(
         "  接收缓冲区大小: {} 字节",
         state.config.server_performance.recv_buffer_size
+    );
+    info!(
+        "  存档缓存最大容量: {}",
+        state.config.server_performance.archive_cache_max_capacity
+    );
+    info!(
+        "  流式读取块大小: {} 字节",
+        state.config.server_performance.stream_read_buffer_size
     );
     info!("API 端点:");
     info!("  GET /health - 健康检查");

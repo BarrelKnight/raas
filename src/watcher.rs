@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::cache::ArchiveCache;
 
@@ -175,7 +175,7 @@ fn flush(cache: &ArchiveCache, pending: &mut HashSet<PathBuf>) {
     for path in pending.drain() {
         let invalidated = cache.invalidate(&path);
         if !invalidated.is_empty() {
-            debug!("源路径变更 {:?},失效缓存: {:?}", path, invalidated);
+            trace!(changed = %path.display(), victims = ?invalidated, "源路径变更导致缓存失效");
             total_invalidated += invalidated.len();
         }
     }

@@ -2,7 +2,9 @@ use crate::archive::{Archive, ArchiveFormat, create_archive};
 use moka::sync::Cache;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use tracing::{debug, trace};
 
 /// 存档缓存管理器
 ///
@@ -20,7 +22,25 @@ pub struct ArchiveCache {
 impl ArchiveCache {
     /// 创建新的存档缓存
     pub fn new(max_capacity: u64) -> Self {
-        let cache = Cache::builder().max_capacity(max_capacity).build();
+        let cache = Cache::builder()
+            .max_capacity(max_capacity)
+            .eviction_listener(|key: Arc<(PathBuf, ArchiveFormat)>, _value, cause| {
+                // Explicit/Replaced 由主动失效或覆盖触发,已有对应日志;
+                // 这里只关注容量或 TTL 导致的淘汰,便于定位缓存频繁重建
+                if matches!(
+                    cause,
+                    moka::notification::RemovalCause::Size
+                        | moka::notification::RemovalCause::Expired
+                ) {
+                    debug!(
+                        path = ?key.0,
+                        format = ?key.1,
+                        reason = ?cause,
+                        "存档缓存条目被淘汰"
+                    );
+                }
+            })
+            .build();
 
         Self {
             cache,
@@ -36,11 +56,27 @@ impl ArchiveCache {
         format: ArchiveFormat,
     ) -> Result<Arc<dyn Archive>, anyhow::Error> {
         let key = (path.to_path_buf(), format);
+        let created = AtomicBool::new(false);
 
         // 使用 get_with 实现原子性加载，避免并发时的重复创建
         let result = self.cache.get_with(key, || {
+            created.store(true, Ordering::Relaxed);
             create_archive(path, format).map_err(|e| e.to_string())
         });
+
+        if created.load(Ordering::Relaxed) {
+            trace!(
+                path = %path.display(),
+                format = ?format,
+                "存档缓存未命中,已构建并缓存"
+            );
+        } else {
+            trace!(
+                path = %path.display(),
+                format = ?format,
+                "存档缓存命中"
+            );
+        }
 
         // 无论成功与否都记录缓存键:失败结果同样被 moka 缓存,
         // 待源目录修复后需要靠文件系统事件将其失效以便重试
@@ -81,6 +117,12 @@ impl ArchiveCache {
         for key in &victims {
             keys.remove(key);
         }
+
+        debug!(
+            changed = %changed_path.display(),
+            victims = victims.len(),
+            "失效受影响的存档缓存"
+        );
 
         victims
     }
