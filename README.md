@@ -44,6 +44,7 @@ RAAS 最具创新性的特性是**支持对 tar 压缩流的随机访问**。这
    - 严格的 512 字节对齐处理
    - 正确的目录项和文件项区分
 5. **路径安全验证**: 防止路径穿越攻击,确保访问路径在 DATA_ROOT 范围内
+6. **不阻塞异步运行时**: 归档扫描与文件读取都是同步 I/O,统一放在阻塞线程池执行;流式响应体通过有界通道把数据块交回异步流,客户端断开时任务自动退出
 
 ### 原理
 
@@ -126,7 +127,7 @@ curl -H "Range: bytes=0-1023" http://127.0.0.1:8080/api/archive/download?path=my
 | `BIND_ADDR` | 监听地址 | `0.0.0.0:8080` |
 | `MAX_CONCURRENT_REQUESTS` | 最大并发请求数 | `100` |
 | `THREAD_POOL_SIZE` | 线程池大小 | `4` |
-| `STREAM_READ_BUFFER_SIZE` | 流式读取缓冲区大小(字节) | `8192` |
+| `STREAM_READ_BUFFER_SIZE` | 流式读取块大小(字节,低于 65536 会被提升) | `131072` |
 | `ARCHIVE_CACHE_MAX_CAPACITY` | 存档缓存最大容量 | `100` |
 | `ENABLE_FILE_WATCHER` | 是否启用文件系统监听以自动失效缓存 | `true` |
 | `FILE_WATCHER_DEBOUNCE_MS` | 文件系统事件抖动合并窗口(毫秒) | `200` |

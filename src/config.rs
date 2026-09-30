@@ -8,7 +8,9 @@ mod defaults {
     pub const BLOCKING_QUEUE_SIZE: usize = 1024;
     pub const SEND_BUFFER_SIZE: usize = 262144; // 256KB - 优化大文件流式传输性能
     pub const RECV_BUFFER_SIZE: usize = 16384; // 16KB - 仅接收GET请求头，无需太大
-    pub const STREAM_READ_BUFFER_SIZE: usize = 16384; // 16KB - 平衡内存和性能，与文件系统块对齐
+    // 128KB - 流式路径按块跨线程交接,块越大交接(系统调用)次数越少;
+    // 过小会显著增加系统调用开销
+    pub const STREAM_READ_BUFFER_SIZE: usize = 128 * 1024;
     pub const ARCHIVE_CACHE_MAX_CAPACITY: u64 = 100;
     pub const ENABLE_FILE_WATCHER: bool = true;
     pub const FILE_WATCHER_DEBOUNCE_MS: u64 = 200;

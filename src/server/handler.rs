@@ -2,33 +2,31 @@ use async_stream::stream;
 use axum::body::Body;
 use axum::{
     Router,
+    body::Bytes,
     extract::{Query, State},
     http::{HeaderValue, Request, StatusCode, header},
     response::Response,
     routing::get,
-    body::Bytes,
 };
 use bytes::BytesMut;
 use serde::Deserialize;
 use std::io::Read;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-use crate::{
-    archive::RandomAccessArchive,
-    state::AppState,
-    error::ArchiveApiError,
-};
+use crate::{archive::RandomAccessArchive, error::ArchiveApiError, state::AppState};
 
 /// 路径验证函数
 pub fn resolve_and_validate_path(
-    root: &std::path::PathBuf, 
-    relative_path: &str
+    root: &std::path::PathBuf,
+    relative_path: &str,
 ) -> Result<std::path::PathBuf, ArchiveApiError> {
-    let root = root.canonicalize()
-        .map_err(|e| ArchiveApiError::InternalError(anyhow::anyhow!("解析数据根目录失败: {}", e)))?;
-    
+    let root = root.canonicalize().map_err(|e| {
+        ArchiveApiError::InternalError(anyhow::anyhow!("解析数据根目录失败: {}", e))
+    })?;
+
     let full_path = root.join(relative_path);
-    
+
     // 检查路径是否超出数据根目录
     // 使用 normalize 逻辑而不是 canonicalize，因为文件可能不存在
     let normalized = if full_path.is_absolute() {
@@ -36,26 +34,34 @@ pub fn resolve_and_validate_path(
     } else {
         root.join(&full_path)
     };
-    
+
     // 简单检查：确保路径没有通过 .. 跳出 root
     if !normalized.starts_with(&root) {
-        return Err(ArchiveApiError::BadRequest("非法路径: 超出数据根目录".to_string()));
+        return Err(ArchiveApiError::BadRequest(
+            "非法路径: 超出数据根目录".to_string(),
+        ));
     }
-    
+
     // 如果路径存在，进行 canonicalize 验证
     if full_path.exists() {
-        let canonicalized = full_path.canonicalize()
-            .map_err(|e| ArchiveApiError::InternalError(anyhow::anyhow!("解析目标路径失败: {}", e)))?;
-        
+        let canonicalized = full_path.canonicalize().map_err(|e| {
+            ArchiveApiError::InternalError(anyhow::anyhow!("解析目标路径失败: {}", e))
+        })?;
+
         // 再次检查 canonicalize 后的路径是否仍在 root 内
         if !canonicalized.starts_with(&root) {
-            return Err(ArchiveApiError::BadRequest("非法路径: 超出数据根目录".to_string()));
+            return Err(ArchiveApiError::BadRequest(
+                "非法路径: 超出数据根目录".to_string(),
+            ));
         }
-        
+
         Ok(canonicalized)
     } else {
         // 路径不存在，返回 BadRequest
-        Err(ArchiveApiError::BadRequest(format!("路径不存在: {}", relative_path)))
+        Err(ArchiveApiError::BadRequest(format!(
+            "路径不存在: {}",
+            relative_path
+        )))
     }
 }
 
@@ -69,36 +75,39 @@ mod path_tests {
     fn test_resolve_and_validate_path_success() {
         let temp_dir = tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
-        
+
         // 创建测试子目录
         let test_dir = root.join("test");
         fs::create_dir(&test_dir).unwrap();
-        
+
         // 测试正常路径解析
         let result = resolve_and_validate_path(&root, "test");
         assert!(result.is_ok());
-        
+
         let resolved = result.unwrap();
-        assert_eq!(resolved.canonicalize().unwrap(), test_dir.canonicalize().unwrap());
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            test_dir.canonicalize().unwrap()
+        );
     }
 
     #[test]
     fn test_resolve_and_validate_path_security() {
         let temp_dir = tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
-        
+
         // 创建测试文件
         let safe_file = root.join("safe.txt");
         fs::write(&safe_file, b"safe").unwrap();
-        
+
         // 正常路径应该成功
         let result = resolve_and_validate_path(&root, "safe.txt");
         assert!(result.is_ok());
-        
+
         // 路径穿越应该失败
         let result = resolve_and_validate_path(&root, "../../../etc/passwd");
         assert!(result.is_err());
-        
+
         // 绝对路径跳出 root 应该失败
         let result = resolve_and_validate_path(&root, "/etc/passwd");
         assert!(result.is_err());
@@ -108,11 +117,11 @@ mod path_tests {
     fn test_resolve_and_validate_path_nonexistent() {
         let temp_dir = tempdir().unwrap();
         let root = temp_dir.path().to_path_buf();
-        
+
         // 不存在的路径应该返回 BadRequest
         let result = resolve_and_validate_path(&root, "nonexistent.txt");
         assert!(result.is_err());
-        
+
         match result {
             Err(ArchiveApiError::BadRequest(msg)) => {
                 assert!(msg.contains("不存在"));
@@ -172,14 +181,17 @@ mod path_tests {
 }
 
 /// 填充通用响应头到已有的 Response 对象
-fn populate_common_headers(response: &mut Response<Body>, file_name: &str) -> Result<(), ArchiveApiError> {
+fn populate_common_headers(
+    response: &mut Response<Body>,
+    file_name: &str,
+) -> Result<(), ArchiveApiError> {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-tar"),
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    
+
     let content_disposition = format!("attachment; filename=\"{}\"", file_name);
     headers.insert(
         header::CONTENT_DISPOSITION,
@@ -189,15 +201,35 @@ fn populate_common_headers(response: &mut Response<Body>, file_name: &str) -> Re
     Ok(())
 }
 
+/// 流式响应体的有界通道容量(单位为缓冲块)
+///
+/// 单请求在途内存约为 `读取块大小 × (STREAM_CHANNEL_CAPACITY + 1)`,默认约 384KB。
+/// 加大容量只会增加内存,不会提升吞吐。
+const STREAM_CHANNEL_CAPACITY: usize = 2;
+
+/// 流式读取块大小的下限
+///
+/// 读取循环在阻塞线程池中执行,每个数据块要经通道交接回异步流;
+/// 块过小会使交接(系统调用)次数暴涨——实测 16KB 时的 CPU 开销约为 128KB 的 4 倍,
+/// 因此对配置值设一个下限兜底。
+const MIN_STREAM_READ_BUFFER_SIZE: usize = 64 * 1024;
+
 /// 创建流式响应体
+///
+/// 归档读取是同步文件 I/O,若直接在异步流中轮询会阻塞 Tokio 工作线程
+/// (线程池较小时会明显拖慢并发)。因此把读取循环放入 `spawn_blocking`,
+/// 通过有界通道把数据块交回异步流。客户端断开时接收端被丢弃,
+/// `blocking_send` 随即失败,阻断任务随之退出。
 fn create_stream_body(
     archive: Arc<RandomAccessArchive>,
     start: u64,
     end: u64,
     buffer_size: usize,
 ) -> Body {
-    let stream = stream! {
+    let buffer_size = buffer_size.max(MIN_STREAM_READ_BUFFER_SIZE);
+    let (tx, mut rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
 
+    tokio::task::spawn_blocking(move || {
         let mut stream_reader = archive.stream_range_writer(start, end);
 
         // 优化：使用 BytesMut 管理 buffer，通过 freeze() 实现零拷贝转换
@@ -207,22 +239,34 @@ fn create_stream_body(
             // 清空但保留容量，避免重新分配
             buffer.clear();
             buffer.resize(buffer_size, 0);
-            
+
             match stream_reader.read(&mut buffer) {
                 Ok(0) => break, // 没有更多数据了
                 Ok(n) => {
                     // truncate 到实际读取的大小
                     buffer.truncate(n);
                     // freeze() 将 BytesMut 转换为 Bytes，无需数据拷贝
-                    yield Ok::<Bytes, std::io::Error>(buffer.split().freeze());
-                },
+                    let chunk = buffer.split().freeze();
+                    if tx.blocking_send(Ok(chunk)).is_err() {
+                        // 接收端已关闭(客户端断开)
+                        break;
+                    }
+                }
                 Err(e) => {
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                    let _ = tx.blocking_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )));
                     break;
                 }
             }
         }
+    });
 
+    let stream = stream! {
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
     };
 
     Body::from_stream(stream)
@@ -230,8 +274,7 @@ fn create_stream_body(
 
 // 压缩模块路由
 pub fn archive_router() -> Router<AppState> {
-    Router::new()
-        .route("/download", get(download_random_access_archive))
+    Router::new().route("/download", get(download_random_access_archive))
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,13 +296,18 @@ pub async fn download_random_access_archive(
     // 解析路径（相对于 DATA_ROOT）
     let source_path = resolve_and_validate_path(&state.config.data_root, &params.path)?;
 
-    let archive = state
-        .archive_cache
-        .get_or_create(&source_path)
+    // 归档扫描是同步目录遍历,放在阻塞线程池中执行,避免占用 Tokio 工作线程
+    let cache = state.archive_cache.clone();
+    let archive = tokio::task::spawn_blocking(move || cache.get_or_create(&source_path))
+        .await
+        .map_err(|e| ArchiveApiError::InternalError(anyhow::anyhow!("归档构建任务失败: {}", e)))?
         .map_err(|e| {
             // 如果是路径不存在相关的错误，返回 BadRequest
             let error_msg = e.to_string();
-            if error_msg.contains("不存在") || error_msg.contains("not found") || error_msg.contains("No such file") {
+            if error_msg.contains("不存在")
+                || error_msg.contains("not found")
+                || error_msg.contains("No such file")
+            {
                 ArchiveApiError::BadRequest(error_msg)
             } else {
                 ArchiveApiError::InternalError(e)
@@ -283,8 +331,8 @@ pub async fn download_random_access_archive(
         let range_str = range_val
             .to_str()
             .map_err(|_| ArchiveApiError::BadRequest("无效的Range头".to_string()))?;
-        let ranges =
-            parse_range_header(range_str).map_err(|_| ArchiveApiError::BadRequest("无法解析Range头".to_string()))?;
+        let ranges = parse_range_header(range_str)
+            .map_err(|_| ArchiveApiError::BadRequest("无法解析Range头".to_string()))?;
 
         if let Some(&(req_start, req_end)) = ranges.first() {
             (
@@ -300,14 +348,8 @@ pub async fn download_random_access_archive(
     } else {
         // 没有Range头，返回完整文件
         let total_size = archive.total_size();
-        (
-            0,
-            total_size,
-            StatusCode::OK,
-            total_size,
-        )
+        (0, total_size, StatusCode::OK, total_size)
     };
-
 
     let total_size = archive.total_size();
 
@@ -321,13 +363,12 @@ pub async fn download_random_access_archive(
 
     let mut response = Response::new(body);
     *response.status_mut() = status;
-    
+
     // 优化：使用 HeaderValue::from 直接转换数字，避免 format! 字符串分配
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from(content_length),
-    );
-    
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
+
     // 优化：直接填充头部，避免 create_common_headers + extend 的开销
     populate_common_headers(&mut response, &file_name)?;
 
@@ -337,8 +378,9 @@ pub async fn download_random_access_archive(
         let content_range = format!("bytes {}-{}/{}", start, end - 1, total_size);
         response.headers_mut().insert(
             header::CONTENT_RANGE,
-            HeaderValue::try_from(content_range)
-                .map_err(|_| ArchiveApiError::InternalError(anyhow::anyhow!("无效的 Content-Range 头")))?,
+            HeaderValue::try_from(content_range).map_err(|_| {
+                ArchiveApiError::InternalError(anyhow::anyhow!("无效的 Content-Range 头"))
+            })?,
         );
     }
 

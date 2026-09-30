@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 # HTTP 服务器
 axum = { version = "0.8.7", features = ["json", "tokio"] }
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "sync"] }
 async-stream = "0.3.6"
 
 # 序列化
