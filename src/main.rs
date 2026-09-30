@@ -29,9 +29,10 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(config: AppConfig) -> Result<()> {
-    // 初始化日志:默认 info,可通过 RUST_LOG 调整(如 RUST_LOG=debug)
+    // 初始化日志:release 构建默认 info,debug 构建默认 debug;
+    // 两种情况下都可通过 RUST_LOG 覆盖(如 RUST_LOG=trace)
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config::default_log_level()));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

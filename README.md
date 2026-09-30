@@ -158,14 +158,19 @@ curl -H "Range: bytes=0-1023" "http://127.0.0.1:8080/api/archive/download?path=m
 
 ### 日志
 
-服务使用 `tracing` 输出结构化日志,默认级别为 `info`,每个请求会记录方法、路径、状态码与耗时。可通过环境变量 `RUST_LOG` 调整:
+服务使用 `tracing` 输出结构化日志,每个请求会记录方法、路径、状态码与耗时。默认级别随构建模式变化:**release 构建为 `info`**,**debug(`cargo run`/`cargo test`)构建为 `debug`**。
+
+可通过环境变量 `RUST_LOG` 覆盖默认级别:
 
 ```bash
-# 输出缓存命中/未命中、归档构建与流式传输统计等
+# 强制输出缓存命中/未命中、归档构建与流式传输统计等
 export RUST_LOG=debug
 
 # 含缓存失效明细与 zip CRC 计算等更细粒度信息
 export RUST_LOG=raas=trace
+
+# release 下只想看错误
+export RUST_LOG=error
 ```
 
 ### Cargo Features

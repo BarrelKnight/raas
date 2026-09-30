@@ -1,5 +1,16 @@
 use std::path::PathBuf;
 
+/// 默认日志级别:debug 构建使用 `debug`,release 构建使用 `info`
+///
+/// 最终级别仍可被环境变量 `RUST_LOG` 覆盖(见 `main.rs`)。
+pub fn default_log_level() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "info"
+    }
+}
+
 /// 默认配置常量
 mod defaults {
     pub const BIND_ADDR: &str = "0.0.0.0:8080";
@@ -144,6 +155,17 @@ impl Default for AppConfig {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_default_log_level() {
+        // 测试(debug)构建下默认级别应为 debug;release 构建下为 info
+        let expected = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "info"
+        };
+        assert_eq!(default_log_level(), expected);
+    }
 
     #[test]
     fn test_server_performance_config_default() {
