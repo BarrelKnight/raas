@@ -10,6 +10,8 @@ mod defaults {
     pub const RECV_BUFFER_SIZE: usize = 16384; // 16KB - 仅接收GET请求头，无需太大
     pub const STREAM_READ_BUFFER_SIZE: usize = 16384; // 16KB - 平衡内存和性能，与文件系统块对齐
     pub const ARCHIVE_CACHE_MAX_CAPACITY: u64 = 100;
+    pub const ENABLE_FILE_WATCHER: bool = true;
+    pub const FILE_WATCHER_DEBOUNCE_MS: u64 = 200;
 }
 
 /// 服务器性能配置
@@ -29,6 +31,10 @@ pub struct ServerPerformanceConfig {
     pub stream_read_buffer_size: usize,
     /// 存档缓存最大容量
     pub archive_cache_max_capacity: u64,
+    /// 是否启用文件系统监听以自动失效缓存
+    pub enable_file_watcher: bool,
+    /// 文件系统事件抖动合并窗口（毫秒）
+    pub file_watcher_debounce_ms: u64,
 }
 
 impl Default for ServerPerformanceConfig {
@@ -41,6 +47,8 @@ impl Default for ServerPerformanceConfig {
             recv_buffer_size: defaults::RECV_BUFFER_SIZE,
             stream_read_buffer_size: defaults::STREAM_READ_BUFFER_SIZE,
             archive_cache_max_capacity: defaults::ARCHIVE_CACHE_MAX_CAPACITY,
+            enable_file_watcher: defaults::ENABLE_FILE_WATCHER,
+            file_watcher_debounce_ms: defaults::FILE_WATCHER_DEBOUNCE_MS,
         }
     }
 }
@@ -76,6 +84,19 @@ impl ServerPerformanceConfig {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(defaults::ARCHIVE_CACHE_MAX_CAPACITY),
+            enable_file_watcher: std::env::var("ENABLE_FILE_WATCHER")
+                .ok()
+                .map(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(defaults::ENABLE_FILE_WATCHER),
+            file_watcher_debounce_ms: std::env::var("FILE_WATCHER_DEBOUNCE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(defaults::FILE_WATCHER_DEBOUNCE_MS),
         }
     }
 }
@@ -90,7 +111,8 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| defaults::BIND_ADDR.to_string());
+        let bind_addr =
+            std::env::var("BIND_ADDR").unwrap_or_else(|_| defaults::BIND_ADDR.to_string());
 
         let data_root = std::env::var("DATA_ROOT")
             .map(PathBuf::from)
@@ -124,14 +146,28 @@ mod tests {
     #[test]
     fn test_server_performance_config_default() {
         let config = ServerPerformanceConfig::default();
-        
-        assert_eq!(config.max_concurrent_requests, defaults::MAX_CONCURRENT_REQUESTS);
+
+        assert_eq!(
+            config.max_concurrent_requests,
+            defaults::MAX_CONCURRENT_REQUESTS
+        );
         assert_eq!(config.thread_pool_size, defaults::THREAD_POOL_SIZE);
         assert_eq!(config.blocking_queue_size, defaults::BLOCKING_QUEUE_SIZE);
         assert_eq!(config.send_buffer_size, defaults::SEND_BUFFER_SIZE);
         assert_eq!(config.recv_buffer_size, defaults::RECV_BUFFER_SIZE);
-        assert_eq!(config.stream_read_buffer_size, defaults::STREAM_READ_BUFFER_SIZE);
-        assert_eq!(config.archive_cache_max_capacity, defaults::ARCHIVE_CACHE_MAX_CAPACITY);
+        assert_eq!(
+            config.stream_read_buffer_size,
+            defaults::STREAM_READ_BUFFER_SIZE
+        );
+        assert_eq!(
+            config.archive_cache_max_capacity,
+            defaults::ARCHIVE_CACHE_MAX_CAPACITY
+        );
+        assert_eq!(config.enable_file_watcher, defaults::ENABLE_FILE_WATCHER);
+        assert_eq!(
+            config.file_watcher_debounce_ms,
+            defaults::FILE_WATCHER_DEBOUNCE_MS
+        );
     }
 
     #[test]
@@ -147,15 +183,15 @@ mod tests {
             std::env::remove_var("STREAM_READ_BUFFER_SIZE");
             std::env::remove_var("ARCHIVE_CACHE_MAX_CAPACITY");
         }
-        
+
         // 设置自定义环境变量
         unsafe {
             std::env::set_var("MAX_CONCURRENT_REQUESTS", "200");
             std::env::set_var("THREAD_POOL_SIZE", "8");
             std::env::set_var("BLOCKING_QUEUE_SIZE", "2048");
-            std::env::set_var("SEND_BUFFER_SIZE", "524288");  // 512KB
-            std::env::set_var("RECV_BUFFER_SIZE", "32768");  // 32KB
-            std::env::set_var("STREAM_READ_BUFFER_SIZE", "32768");  // 32KB
+            std::env::set_var("SEND_BUFFER_SIZE", "524288"); // 512KB
+            std::env::set_var("RECV_BUFFER_SIZE", "32768"); // 32KB
+            std::env::set_var("STREAM_READ_BUFFER_SIZE", "32768"); // 32KB
             std::env::set_var("ARCHIVE_CACHE_MAX_CAPACITY", "50");
         }
 
@@ -189,7 +225,7 @@ mod tests {
             std::env::remove_var("MAX_CONCURRENT_REQUESTS");
             std::env::remove_var("THREAD_POOL_SIZE");
         }
-        
+
         // 设置无效的环境变量（非数字）
         unsafe {
             std::env::set_var("MAX_CONCURRENT_REQUESTS", "invalid");
@@ -199,7 +235,10 @@ mod tests {
         let config = ServerPerformanceConfig::from_env();
 
         // 应该使用默认值
-        assert_eq!(config.max_concurrent_requests, defaults::MAX_CONCURRENT_REQUESTS);
+        assert_eq!(
+            config.max_concurrent_requests,
+            defaults::MAX_CONCURRENT_REQUESTS
+        );
         assert_eq!(config.thread_pool_size, defaults::THREAD_POOL_SIZE);
 
         // 清理环境变量
@@ -212,10 +251,13 @@ mod tests {
     #[test]
     fn test_app_config_default() {
         let config = AppConfig::default();
-        
+
         assert_eq!(config.bind_addr, defaults::BIND_ADDR);
         assert_eq!(config.data_root, PathBuf::from("."));
-        assert_eq!(config.server_performance.max_concurrent_requests, defaults::MAX_CONCURRENT_REQUESTS);
+        assert_eq!(
+            config.server_performance.max_concurrent_requests,
+            defaults::MAX_CONCURRENT_REQUESTS
+        );
     }
 
     #[test]
@@ -233,10 +275,10 @@ mod tests {
             std::env::remove_var("STREAM_READ_BUFFER_SIZE");
             std::env::remove_var("ARCHIVE_CACHE_MAX_CAPACITY");
         }
-        
+
         // 不设置任何环境变量，使用默认值
         let config = AppConfig::from_env().unwrap();
-        
+
         assert_eq!(config.bind_addr, defaults::BIND_ADDR);
         assert_eq!(config.data_root, PathBuf::from("."));
     }
@@ -256,7 +298,7 @@ mod tests {
             std::env::remove_var("STREAM_READ_BUFFER_SIZE");
             std::env::remove_var("ARCHIVE_CACHE_MAX_CAPACITY");
         }
-        
+
         // 设置自定义环境变量
         unsafe {
             std::env::set_var("BIND_ADDR", "0.0.0.0:3000");

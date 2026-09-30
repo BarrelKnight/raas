@@ -6,10 +6,12 @@ pub mod config;
 pub mod error;
 pub mod server;
 pub mod state;
+pub mod watcher;
 
 // 便捷重导出
 pub use archive::RandomAccessArchive;
 pub use cache::ArchiveCache;
 pub use config::AppConfig;
-pub use state::AppState;
 pub use server::create_app_routes;
+pub use state::AppState;
+pub use watcher::FileSystemWatcher;
